@@ -42,6 +42,51 @@ export interface SpawnOptions {
 }
 
 /**
+ * Build the prompt for an `enhance` task — one that runs a /vibe-enhance pass
+ * over a just-completed feature group. The subagent doesn't implement
+ * anything itself; it invokes the /vibe-enhance skill, which spawns a fresh
+ * researcher, triages findings, applies scoped additions, and chains into
+ * /review-loop. Same DEFER protocol so a skipped/no-op outcome doesn't fail
+ * the run.
+ *
+ * `task.body` is expected to contain a markdown bullet list of completed
+ * user task titles, written by the orchestrator at injection time. Keeping
+ * it on the task itself means resume after a crash works without re-deriving
+ * the scope from elsewhere.
+ */
+export function buildEnhanceSubagentPrompt(task: Task): string {
+  const featureLabel =
+    task.feature && task.feature.trim()
+      ? `feature group "${task.feature}"`
+      : `the entire run (no feature headings present)`;
+
+  return [
+    `# vibe-enhance pass`,
+    ``,
+    `You are running inside a full-auto orchestrator. Your single job is to invoke the /vibe-enhance skill on the work just completed and let the skill drive everything from there. You do NOT implement anything yourself outside of what /vibe-enhance instructs.`,
+    ``,
+    `## Scope of this pass`,
+    `Just-completed: ${featureLabel}.`,
+    ``,
+    `User tasks that finished in this group:`,
+    task.body || '  (no user tasks recorded — likely an empty group, please proceed anyway)',
+    ``,
+    `## What to do`,
+    `1. Invoke the /vibe-enhance skill in post-work mode. Pass it the feature label and the task list above as context.`,
+    `2. Let /vibe-enhance run its full flow: spawn a fresh researcher subagent (with WebSearch), triage findings, apply only FIT-BREAK and small ENHANCE additions, and chain into /review-loop on whatever it added.`,
+    `3. Honor the skill's "no-op is a valid outcome" rule. If the researcher returns nothing actionable, finish with that outcome cleanly. Do NOT invent additions to justify the pass.`,
+    `4. Do not modify code outside what /vibe-enhance directs you to apply. No opportunistic refactors, no scope creep into the next feature group.`,
+    ``,
+    `## Output protocol`,
+    `If the /vibe-enhance pass cannot run (skill missing, /review-loop blocked an addition you can't fix, environmental issue), end your final message with this line on its own:`,
+    ``,
+    `   FULLAUTO_RESULT: DEFER <one-line reason>`,
+    ``,
+    `Otherwise finish normally. The orchestrator runs verification gates after you exit; if any addition you applied breaks a gate, the task defers and is retried in the next pass with the same scope.`,
+  ].join('\n');
+}
+
+/**
  * Build the prompt sent to the implementer subagent.
  *
  * Constraints we enforce by prompt:
@@ -181,7 +226,10 @@ export async function runSubagent(
     }
   }
 
-  const prompt = buildSubagentPrompt(task, config, actuallyPlaceheld);
+  const prompt =
+    task.kind === 'enhance'
+      ? buildEnhanceSubagentPrompt(task)
+      : buildSubagentPrompt(task, config, actuallyPlaceheld);
 
   await mkdir(dirname(logPath), { recursive: true });
   const logStream = createWriteStream(logPath, { flags: 'w' });

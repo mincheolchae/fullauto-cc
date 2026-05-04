@@ -117,19 +117,54 @@ function stripPrerequisitesSection(source: string): string {
   return source.slice(0, m.index);
 }
 
+// h2 heading that introduces a feature group in HAND-WRITTEN tasks.md.
+// Tasks following it (until the next h2) belong to that feature. Allow
+// optional "Feature: " prefix so users can write either `## Auth flow` or
+// `## Feature: Auth flow`. NOT used when the file is Speckit-format (see
+// fileUsesStoryLabels below) — Speckit's h2 is "Phase N: ..." which spans
+// multiple categories beyond what we want as feature boundaries.
+const FEATURE_HEADING = /^##\s+(?:Feature\s*:\s*)?(.+?)\s*$/i;
+
+// Speckit task lines carry a `[USx]` story label and optionally `[P]`
+// (parallel-safe) flag right after the ID. The story label IS the feature
+// boundary in Speckit — each user story is "delivered as an MVP increment"
+// per the template. We pre-scan for any [USx] occurrence to detect Speckit
+// mode automatically; in that mode, h2 is ignored.
+const STORY_LABEL = /\[\s*(US\d+)\s*\]/i;
+const PARALLEL_FLAG = /\[\s*P\s*\]/gi;
+
+function stripSpeckitFlags(rawTitle: string): {
+  storyId: string | undefined;
+  cleanTitle: string;
+} {
+  const storyMatch = rawTitle.match(STORY_LABEL);
+  const storyId = storyMatch ? storyMatch[1].toUpperCase() : undefined;
+  const cleaned = rawTitle
+    .replace(STORY_LABEL, '')
+    .replace(PARALLEL_FLAG, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return { storyId, cleanTitle: cleaned };
+}
+
 export function parseTasksMarkdown(source: string): Task[] {
   const lines = stripPrerequisitesSection(source).split(/\r?\n/);
   const tasks: Task[] = [];
   let current: { task: Task; bodyLines: string[] } | null = null;
+  let currentFeature: string | undefined = undefined;
 
-  // First pass: collect every explicit ID present in the file so the auto-ID
-  // counter can skip them and never collide. (Without this, "T001 → unlabeled
-  // → T002" would auto-assign the unlabeled task as T002, duplicating the
-  // explicit T002 that follows.)
+  // First pass: (a) collect every explicit ID so the auto-ID counter can
+  // skip them and never collide; (b) decide whether the file is Speckit
+  // format (any `[USx]` label present anywhere). The two passes through
+  // `classifyLine` are cheap — bodies aren't needed yet.
   const explicitIds = new Set<string>();
+  let fileUsesStoryLabels = false;
   for (const line of lines) {
     const parsed = classifyLine(line);
-    if (parsed.isTaskLine && parsed.id) explicitIds.add(parsed.id);
+    if (parsed.isTaskLine) {
+      if (parsed.id) explicitIds.add(parsed.id);
+      if (STORY_LABEL.test(parsed.rawTitle)) fileUsesStoryLabels = true;
+    }
   }
   let autoCounter = 1;
   const nextAutoId = (): string => {
@@ -154,10 +189,37 @@ export function parseTasksMarkdown(source: string): Task[] {
       if (current) current.bodyLines.push('');
       continue;
     }
+
+    // h2 heading switches the active feature group — but ONLY in hand-written
+    // (non-Speckit) mode. Speckit's h2 is "Phase N: ..." which spans Setup /
+    // Foundational / each User Story / Polish, and only the User Story phases
+    // are real feature boundaries. The story label on each task gives that
+    // information directly, so h2 is redundant noise in Speckit mode.
+    const headingMatch = line.match(FEATURE_HEADING);
+    if (headingMatch) {
+      finalize();
+      if (!fileUsesStoryLabels) {
+        currentFeature = headingMatch[1].trim();
+      }
+      continue;
+    }
+
     const parsed = classifyLine(line);
     if (parsed.isTaskLine) {
       finalize();
-      const { cleanTitle, dependencies } = extractDependencies(parsed.rawTitle);
+      // In Speckit mode: feature comes from the [USx] label on this line —
+      // tasks without a label (Setup/Foundational/Polish) get feature=undefined
+      // and form one implicit group, so enhance fires only after every cross-
+      // cutting task is also done (i.e. effectively "end of run").
+      // In hand-written mode: feature comes from the most recent h2 heading.
+      let titleForExtract = parsed.rawTitle;
+      let feature: string | undefined = currentFeature;
+      if (fileUsesStoryLabels) {
+        const stripped = stripSpeckitFlags(parsed.rawTitle);
+        titleForExtract = stripped.cleanTitle;
+        feature = stripped.storyId; // may be undefined for non-story tasks
+      }
+      const { cleanTitle, dependencies } = extractDependencies(titleForExtract);
       const id = parsed.id ?? nextAutoId();
       current = {
         task: {
@@ -167,6 +229,8 @@ export function parseTasksMarkdown(source: string): Task[] {
           dependencies,
           status: 'pending',
           attempts: [],
+          feature,
+          kind: 'user',
         },
         bodyLines: [],
       };

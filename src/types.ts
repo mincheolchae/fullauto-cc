@@ -40,6 +40,9 @@ export const TaskAttempt = z.object({
 });
 export type TaskAttempt = z.infer<typeof TaskAttempt>;
 
+export const TaskKind = z.enum(['user', 'enhance']);
+export type TaskKind = z.infer<typeof TaskKind>;
+
 export const Task = z.object({
   id: z.string(),
   title: z.string(),
@@ -47,6 +50,25 @@ export const Task = z.object({
   dependencies: z.array(z.string()).default([]),
   status: TaskStatus.default('pending'),
   attempts: z.array(TaskAttempt).default([]),
+  /**
+   * Feature group key. Source depends on tasks.md format (auto-detected by
+   * the parser):
+   *   - Speckit format (any task line carries a `[USx]` label) → feature is
+   *     the story id, e.g. `"US1"`. Tasks without a label (Setup /
+   *     Foundational / Polish phases) get `feature: undefined`.
+   *   - Hand-written format (no `[USx]` labels anywhere) → feature is the
+   *     most recent `## ` h2 heading text.
+   * Tasks with `feature: undefined` form one implicit group; vibe-enhance
+   * fires once for that group at the end.
+   */
+  feature: z.string().optional(),
+  /**
+   * `user` = parsed from tasks.md (or written by planner). `enhance` =
+   * synthetic task injected by the orchestrator to run a /vibe-enhance pass
+   * after a feature group completes. Distinguished so the runner can use a
+   * different prompt and reports can label them.
+   */
+  kind: TaskKind.default('user'),
 });
 export type Task = z.infer<typeof Task>;
 
@@ -172,6 +194,19 @@ export const RunConfig = z.object({
   subagentTimeoutSec: z.number().int().positive().default(1800),
   /** Whether to instruct the implementer subagent to invoke /review-loop. */
   useReviewLoop: z.boolean().default(true),
+  /**
+   * If true, the orchestrator injects a synthetic `enhance` task after each
+   * feature group's user tasks complete. That task spawns a Claude subagent
+   * which invokes the /vibe-enhance skill — a fresh researcher subagent
+   * compares the just-completed work against latest trends and applies any
+   * scoped FIT-BREAK / ENHANCE additions, then routes them through
+   * /review-loop. Failed enhance tasks defer like any other task.
+   *
+   * No h2 headings in tasks.md = one implicit feature spanning the whole run,
+   * so this gives a single end-of-run pass for the auto-mode case where the
+   * planner doesn't write headings.
+   */
+  vibeEnhance: z.boolean().default(false),
   /**
    * Background services started once at run begin and stopped at run end.
    * Read-after-ready env files (e.g. .env.local) merge into process.env so

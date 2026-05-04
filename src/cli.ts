@@ -261,6 +261,11 @@ program
     'In non-interactive mode, abort if any [ENV] prerequisite is unset',
     false
   )
+  .option(
+    '--vibe-enhance',
+    'After each feature group finishes, run a /vibe-enhance pass — researcher subagent compares against latest trends and applies scoped additions, then routes them through /review-loop. Feature groups are auto-detected from [USx] labels (Speckit format) or `## ` h2 headings (hand-written). No grouping = one pass at the end.',
+    false
+  )
   .action(
     async (
       tasksFile: string,
@@ -270,6 +275,7 @@ program
         force: boolean;
         yes: boolean;
         strictPrereqs: boolean;
+        vibeEnhance: boolean;
       }
     ) => {
       const projectDir = resolve(opts.dir);
@@ -288,6 +294,11 @@ program
             `--yes / --strict-prereqs only apply to a fresh run — ignored on resume.`
           );
         }
+        if (opts.vibeEnhance) {
+          printWarn(
+            `--vibe-enhance ignored on resume — the original run's setting persists in state.json.`
+          );
+        }
         await reconcileConfigOnResume(projectDir, existing);
         for (const t of existing.tasks) {
           if (t.status === 'in_progress') t.status = 'pending';
@@ -302,6 +313,7 @@ program
         verbose: opts.verbose,
         yes: opts.yes,
         strictPrereqs: opts.strictPrereqs,
+        vibeEnhance: opts.vibeEnhance,
       });
     }
   );
@@ -354,12 +366,19 @@ async function startFreshRun(args: {
    * values for any unset [ENV] items, and report them at run end.
    */
   autoMode?: boolean;
+  /** CLI-level override for config.vibeEnhance. When true, force-enable. */
+  vibeEnhance?: boolean;
 }): Promise<boolean> {
   const { projectDir, tasksPath, verbose, autoMode } = args;
   const tasks = await loadTasksFromFile(tasksPath);
 
   const userConfig = (await loadUserConfig(projectDir)) ?? {};
   const config = RunConfig.parse(userConfig);
+  // CLI flag forces vibeEnhance on for this run. We deliberately don't
+  // implement a way to force it OFF from the CLI — config.json is the place
+  // for that. (If users want it permanently on, set it in config.json and
+  // skip the flag.)
+  if (args.vibeEnhance) config.vibeEnhance = true;
 
   // An empty gates list silently makes every task auto-pass (allGatesPassed
   // returns true on []), defeating the whole verification design.
@@ -564,6 +583,11 @@ program
     (v) => parseInt(v, 10),
     900
   )
+  .option(
+    '--vibe-enhance',
+    'After all planned tasks finish, run a /vibe-enhance pass — fresh researcher subagent looks for trend-based additions beyond what was specified, applies scoped ones, and routes them through /review-loop.',
+    false
+  )
   .action(
     async (
       descriptionParts: string[],
@@ -573,6 +597,7 @@ program
         force: boolean;
         output: string;
         planTimeout: number;
+        vibeEnhance: boolean;
       }
     ) => {
       const projectDir = resolve(opts.dir);
@@ -583,6 +608,11 @@ program
         printInfo(
           `Existing state found — resuming previous run (description ignored). Use --force to discard and re-plan from scratch.`
         );
+        if (opts.vibeEnhance) {
+          printWarn(
+            `--vibe-enhance ignored on resume — the original run's setting persists in state.json.`
+          );
+        }
         await reconcileConfigOnResume(projectDir, existing);
         for (const t of existing.tasks) {
           if (t.status === 'in_progress') t.status = 'pending';
@@ -617,6 +647,7 @@ program
         tasksPath,
         verbose: opts.verbose,
         autoMode: true,
+        vibeEnhance: opts.vibeEnhance,
       });
     }
   );

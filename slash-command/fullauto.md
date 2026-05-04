@@ -20,6 +20,8 @@ Two modes, dispatched automatically by the bash block below:
 
 Both modes use the same per-task pipeline: each task runs in a fresh `claude -p` subagent (with `/review-loop` available), then verification gates (typecheck/test/lint) decide `done` vs `deferred`. Deferred tasks retry on a second pass; anything still unresolved is reported with reasons and log paths.
 
+Append `--vibe-enhance` to either form to layer on a proactive trend-check + improvement pass — see "Vibe-enhance modes" below.
+
 ## Dispatch heuristic
 
 The first whitespace-separated token of `$ARGUMENTS` is checked:
@@ -28,6 +30,28 @@ The first whitespace-separated token of `$ARGUMENTS` is checked:
 - **Anything else** → auto mode (the entire `$ARGUMENTS` is the description).
 
 This means `/fullauto tasks.md --verbose` (existing file) is run mode, but `/fullauto implement the auth flow` is auto mode. If you want auto mode for something that *looks* path-y, write a sentence: `/fullauto build the file uploader`.
+
+Put the file path or description FIRST, flags after. `/fullauto --vibe-enhance tasks.md` would mis-dispatch to auto mode (the leading flag is the first token); `/fullauto tasks.md --vibe-enhance` works.
+
+## Vibe-enhance modes
+
+Both run-mode and auto-mode accept `--vibe-enhance`, which layers a proactive improvement pass on top of the normal per-task pipeline. The pass is implemented by the `/vibe-enhance` skill — a fresh researcher subagent (with WebSearch) compares the just-completed work against latest trends, applies scoped FIT-BREAK / ENHANCE additions, and routes those additions through `/review-loop` for verification. The pass enforces "no-op is a valid outcome" — if nothing's worth adding, the run continues without scope creep.
+
+| Form | Granularity | Example |
+|---|---|---|
+| `/fullauto tasks.md --vibe-enhance` | **Per-feature**, auto-detected from the file. | `/fullauto sprint-tasks.md --vibe-enhance` |
+| `/fullauto <description> --vibe-enhance` | **End-of-run** — one pass after all planned tasks finish. The auto-planner produces flat tasks, so the whole description is one implicit feature. | `/fullauto build a chat app with rooms --vibe-enhance` |
+
+### How the parser detects feature boundaries
+
+Two formats, auto-detected per file:
+
+- **Speckit format** — any task line with a `[USx]` label (e.g. `- [ ] T012 [P] [US1] ...`) switches the parser into Speckit mode. Each user story is one feature; tasks without a `[USx]` label (Setup / Foundational / Polish phases) form one implicit group that fires its enhance pass after all of them complete. h2 headings are ignored in this mode because Speckit's `## Phase N: ...` covers categories beyond features.
+- **Hand-written format** — if no `[USx]` labels are present anywhere, h2 headings (`## Auth flow` or `## Feature: Auth flow`) become feature boundaries.
+
+If neither labels nor h2 headings are present, the whole file is one feature → one enhance pass at the end.
+
+Each enhance pass is a synthetic task (ID prefix `ENHANCE-`) that goes through the same gate pipeline as user tasks. If gates fail (e.g. the addition broke a test), the pass defers and is retried in pass 2. Failures don't roll back the user-task work that came before — only the additions are at risk.
 
 ## Execute
 

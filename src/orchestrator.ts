@@ -1,4 +1,4 @@
-import type { RunState, Task, TaskAttempt, DeferReason } from './types.js';
+import type { RunState, Task, TaskAttempt, DeferReason, TaskKind } from './types.js';
 import { TaskQueue } from './queue.js';
 import { runSubagent, parseSubagentVerdict } from './runner/claude.js';
 import { runGates, allGatesPassed, firstFailedGate } from './runner/gates.js';
@@ -44,6 +44,17 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
 
   // Establish snapshot for the current pass if not already set (resume case).
   queue.snapshotPassStart();
+
+  // Resume gap: if the previous run crashed AFTER the last user task of a
+  // feature finished but BEFORE maybeInjectEnhanceTask got to splice in the
+  // enhance task, that pass would never run. Sweep all features at startup
+  // and inject any missing enhance tasks for already-completed groups. This
+  // is a no-op on a fresh run (no feature can be complete yet) and on
+  // mid-run resume after a normal task crash (whichever group's last task
+  // was in_progress isn't `done`, so it doesn't qualify).
+  if (state.config.vibeEnhance) {
+    sweepCompletedFeaturesForEnhance(state);
+  }
 
   const services = new ServiceManager(projectDir, state.config.services);
   if (!services.isEmpty) {
@@ -93,6 +104,14 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
           throw err;
         }
         await processOneTask(task, projectDir, state, verbose ?? false);
+        // Feature-group completion check: if vibe-enhance is on AND the task
+        // we just finished was a `user` task whose feature group is now
+        // fully done (every other user task in the group is also `done`)
+        // AND we haven't already injected an enhance task for that group →
+        // inject one now, spliced in immediately after the group's last
+        // task so the next `queue.next()` picks it up before moving to a
+        // different group.
+        maybeInjectEnhanceTask(task, state);
         await saveState(projectDir, state);
         task = queue.next();
       }
@@ -194,6 +213,141 @@ function attemptFresh(passNumber: number): TaskAttempt {
     passNumber,
     startedAt: new Date().toISOString(),
     gateResults: [],
+  };
+}
+
+/**
+ * Called after each user task finishes. If vibe-enhance is enabled AND the
+ * task that just finished was a `user` task that reached `done` AND every
+ * other user task in its feature group is also `done` AND no enhance task
+ * has already been injected for that feature group, splice in a synthetic
+ * enhance task at the position right after the group's last task. The next
+ * `queue.next()` will pick it up before any task from a different group.
+ *
+ * Tasks with `feature: undefined` form one implicit group — this is the
+ * "no h2 headings" case (auto-mode, plain tasks.md without grouping). The
+ * single enhance task fires after the very last user task in the file.
+ *
+ * Failed sibling tasks block injection: a feature isn't "complete" if any
+ * of its user tasks went terminal-failed. The check uses `every status ===
+ * 'done'`, so failed/deferred sibling tasks short-circuit it. This matches
+ * the user's intent that vibe-enhance fires only on COMPLETED features.
+ */
+function maybeInjectEnhanceTask(justFinished: Task, state: RunState): void {
+  if (!state.config.vibeEnhance) return;
+  if (justFinished.kind !== 'user') return;
+  if (justFinished.status !== 'done') return;
+
+  const feature = justFinished.feature;
+  const sameGroup = state.tasks.filter(
+    (t) => t.kind === 'user' && t.feature === feature
+  );
+  const allDone = sameGroup.every((t) => t.status === 'done');
+  if (!allDone) return;
+
+  // Already injected for this group? Don't double up.
+  const existingEnhance = state.tasks.find(
+    (t) => t.kind === 'enhance' && t.feature === feature
+  );
+  if (existingEnhance) return;
+
+  // Insert immediately after the group's last task so the natural array-order
+  // scan in `queue.next()` picks the enhance task before tasks of other
+  // groups. For undefined-feature (implicit group), this puts it at the end.
+  let lastIndex = -1;
+  for (let i = 0; i < state.tasks.length; i++) {
+    if (state.tasks[i].kind === 'user' && state.tasks[i].feature === feature) {
+      lastIndex = i;
+    }
+  }
+  if (lastIndex === -1) return; // defensive — sameGroup was non-empty so this shouldn't happen
+
+  const enhanceTask = buildEnhanceTask(feature, sameGroup, state.currentPass);
+  state.tasks.splice(lastIndex + 1, 0, enhanceTask);
+  printInfo(
+    `vibe-enhance pass queued for ${feature ? `feature "${feature}"` : 'end-of-run'} (${enhanceTask.id}).`
+  );
+}
+
+/**
+ * One-shot sweep: for each distinct feature group in `state.tasks`, if all
+ * `user` tasks in the group are `done` and no `enhance` task exists for that
+ * group, splice in an enhance task at the position right after the group's
+ * last task. Used at orchestrator startup to recover from a crash that
+ * killed the per-task injection in `processOneTask`'s caller.
+ */
+function sweepCompletedFeaturesForEnhance(state: RunState): void {
+  // Collect distinct features (including `undefined` for the implicit group).
+  // Use a Map so the implicit group's `undefined` key survives a Set.
+  const featureSeen = new Map<string | undefined, true>();
+  for (const t of state.tasks) {
+    if (t.kind === 'user') featureSeen.set(t.feature, true);
+  }
+  for (const feature of featureSeen.keys()) {
+    const sameGroup = state.tasks.filter(
+      (t) => t.kind === 'user' && t.feature === feature
+    );
+    if (sameGroup.length === 0) continue;
+    if (!sameGroup.every((t) => t.status === 'done')) continue;
+    const existingEnhance = state.tasks.find(
+      (t) => t.kind === 'enhance' && t.feature === feature
+    );
+    if (existingEnhance) continue;
+    let lastIndex = -1;
+    for (let i = 0; i < state.tasks.length; i++) {
+      if (state.tasks[i].kind === 'user' && state.tasks[i].feature === feature) {
+        lastIndex = i;
+      }
+    }
+    if (lastIndex === -1) continue;
+    const enhanceTask = buildEnhanceTask(feature, sameGroup, state.currentPass);
+    state.tasks.splice(lastIndex + 1, 0, enhanceTask);
+    printInfo(
+      `Resume sweep: queued vibe-enhance pass for ${feature ? `feature "${feature}"` : 'end-of-run'} (${enhanceTask.id}).`
+    );
+  }
+}
+
+/**
+ * Construct the synthetic enhance task. ID is derived from the feature name
+ * (or "ALL" for the implicit group) so it's distinguishable from user task
+ * IDs in reports and logs. The body carries the just-completed task titles
+ * so the prompt builder can render them — and so resume after a crash sees
+ * the full scope without recomputing.
+ */
+function buildEnhanceTask(
+  feature: string | undefined,
+  groupTasks: Task[],
+  currentPass: number
+): Task {
+  const slug = feature
+    ? feature
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 40)
+    : 'all';
+  const id = `ENHANCE-${slug || 'group'}`;
+  const titleLabel = feature
+    ? `feature "${feature}"`
+    : 'all completed user tasks';
+  const bodyLines = groupTasks.map((t) => `- ${t.id}: ${t.title}`);
+  // Match the queue's pass-aware status filter: pass 1 looks for 'pending',
+  // pass >= 2 looks for 'deferred'. If we set status='pending' while
+  // currentPass=2, queue.next() never picks it and end-of-pass promotion
+  // turns it into 'deferred' for pass 3 — which under default maxPasses=2
+  // means it never runs.
+  const status = currentPass === 1 ? 'pending' : 'deferred';
+  return {
+    id,
+    title: `vibe-enhance pass for ${titleLabel}`,
+    body: bodyLines.join('\n'),
+    dependencies: groupTasks.map((t) => t.id),
+    status,
+    attempts: [],
+    feature,
+    kind: 'enhance' satisfies TaskKind,
   };
 }
 
