@@ -80,22 +80,49 @@ export function printFinalReport(state: RunState): void {
   );
   if (unresolved.length === 0) {
     console.log(color('green', '\n  ✓ All tasks complete.'));
-    return;
+  } else {
+    console.log('');
+    console.log(color('yellow', '  Unresolved tasks (need user attention):'));
+    for (const t of unresolved) {
+      const last = t.attempts[t.attempts.length - 1];
+      const reason =
+        last?.deferReason ?? (t.status === 'failed' ? 'failed' : 'pending');
+      const detail = last?.deferDetail ?? '';
+      console.log(
+        `    • ${color('cyan', t.id)} [${t.status}] ${t.title}` +
+          `\n      reason: ${reason}${detail ? ` — ${detail}` : ''}` +
+          (last?.subagentLogPath ? `\n      log: ${last.subagentLogPath}` : '')
+      );
+    }
   }
 
+  printPlaceholderEnvs(state.placeholderEnvs ?? []);
+}
+
+/**
+ * Surface env vars that `auto` mode seeded with placeholder values during
+ * the run. These are the ones the user MUST replace before going live.
+ */
+function printPlaceholderEnvs(names: string[]): void {
+  if (names.length === 0) return;
   console.log('');
-  console.log(color('yellow', '  Unresolved tasks (need user attention):'));
-  for (const t of unresolved) {
-    const last = t.attempts[t.attempts.length - 1];
-    const reason =
-      last?.deferReason ?? (t.status === 'failed' ? 'failed' : 'pending');
-    const detail = last?.deferDetail ?? '';
+  console.log(
+    color(
+      'yellow',
+      `  ⚠ Placeholder env vars used during this run (replace with real values before going live):`
+    )
+  );
+  for (const n of names) {
     console.log(
-      `    • ${color('cyan', t.id)} [${t.status}] ${t.title}` +
-        `\n      reason: ${reason}${detail ? ` — ${detail}` : ''}` +
-        (last?.subagentLogPath ? `\n      log: ${last.subagentLogPath}` : '')
+      `    • ${color('cyan', n)}  ${color('dim', `(subagents saw: FULLAUTO_PLACEHOLDER_${n})`)}`
     );
   }
+  console.log(
+    color(
+      'dim',
+      `    Grep for \`FULLAUTO_PLACEHOLDER_\` in the project to find any code that fell back to the placeholder value.`
+    )
+  );
 }
 
 export function printNoProgressBail(): void {

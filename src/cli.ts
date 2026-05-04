@@ -155,6 +155,11 @@ program
         printInfo(
           `Existing state found — resuming. Use --force to discard and start fresh.`
         );
+        if (opts.yes || opts.strictPrereqs) {
+          printWarn(
+            `--yes / --strict-prereqs only apply to a fresh run — ignored on resume.`
+          );
+        }
         await reconcileConfigOnResume(projectDir, existing);
         for (const t of existing.tasks) {
           if (t.status === 'in_progress') t.status = 'pending';
@@ -215,8 +220,14 @@ async function startFreshRun(args: {
   verbose: boolean;
   yes?: boolean;
   strictPrereqs?: boolean;
+  /**
+   * `auto` mode is non-interactive by design: instead of prompting the user
+   * to fix missing env vars, we surface the checklist, seed placeholder
+   * values for any unset [ENV] items, and report them at run end.
+   */
+  autoMode?: boolean;
 }): Promise<boolean> {
-  const { projectDir, tasksPath, verbose } = args;
+  const { projectDir, tasksPath, verbose, autoMode } = args;
   const tasks = await loadTasksFromFile(tasksPath);
 
   const userConfig = (await loadUserConfig(projectDir)) ?? {};
@@ -236,13 +247,20 @@ async function startFreshRun(args: {
     `Loaded ${tasks.length} task(s) from ${tasksPath}. Project: ${projectDir}`
   );
 
-  // Surface manual prerequisites BEFORE writing state.json — if the user
-  // aborts, we leave no on-disk traces of a half-started run.
-  const proceed = await surfacePrerequisites(tasksPath, {
-    skipConfirm: args.yes ?? false,
-    strict: args.strictPrereqs ?? false,
-  });
-  if (!proceed) return false;
+  // In `run` mode (interactive by intent): surface prereqs and ask the user
+  // to confirm. In `auto` mode (non-interactive by intent): surface them
+  // as an FYI but proceed unconditionally, seeding placeholder values for
+  // missing env vars so subagents can still execute.
+  let placeholderEnvs: string[] = [];
+  if (autoMode) {
+    placeholderEnvs = await collectPlaceholderEnvs(tasksPath);
+  } else {
+    const proceed = await surfacePrerequisites(tasksPath, {
+      skipConfirm: args.yes ?? false,
+      strict: args.strictPrereqs ?? false,
+    });
+    if (!proceed) return false;
+  }
 
   const state: RunState = {
     startedAt: new Date().toISOString(),
@@ -250,11 +268,39 @@ async function startFreshRun(args: {
     tasks,
     config,
     passSnapshots: [],
+    placeholderEnvs,
   };
   await saveState(projectDir, state);
 
   await runOrchestrator({ projectDir, state, verbose });
   return true;
+}
+
+/**
+ * In `auto` mode: print the prereq checklist for visibility, then return the
+ * subset of [ENV] entries with valid POSIX names whose value is unset. The
+ * orchestrator seeds those into spawned subagents as FULLAUTO_PLACEHOLDER_<N>
+ * and reports them at run end so the user knows what to replace.
+ */
+async function collectPlaceholderEnvs(tasksPath: string): Promise<string[]> {
+  const prereqs = await loadPrerequisitesFromFile(tasksPath);
+  if (prereqs.length === 0) return [];
+  printPrerequisites(prereqs);
+  const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  const missing = prereqs
+    .filter(
+      (p) =>
+        p.kind === 'ENV' &&
+        ENV_NAME.test(p.identifier) &&
+        !process.env[p.identifier]
+    )
+    .map((p) => p.identifier);
+  if (missing.length > 0) {
+    printInfo(
+      `auto mode: seeding ${missing.length} placeholder env var(s) for subagents — will be reported at run end for replacement.`
+    );
+  }
+  return missing;
 }
 
 program
@@ -370,7 +416,7 @@ program
     'Natural-language description of what you want built'
   )
   .description(
-    'Plan + run in one shot: decompose the description into tasks.md, then execute the orchestrator on it.'
+    'Plan + run in one shot: decompose the description into tasks.md, then execute the orchestrator non-interactively. Missing [ENV] prerequisites are seeded with placeholder values and reported at run end.'
   )
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('-v, --verbose', 'Stream subagent output to stdout', false)
@@ -390,12 +436,6 @@ program
     (v) => parseInt(v, 10),
     900
   )
-  .option('-y, --yes', 'Skip the manual-prerequisites confirmation prompt', false)
-  .option(
-    '--strict-prereqs',
-    'In non-interactive mode, abort if any [ENV] prerequisite is unset',
-    false
-  )
   .action(
     async (
       descriptionParts: string[],
@@ -405,8 +445,6 @@ program
         force: boolean;
         output: string;
         planTimeout: number;
-        yes: boolean;
-        strictPrereqs: boolean;
       }
     ) => {
       const projectDir = resolve(opts.dir);
@@ -450,8 +488,7 @@ program
         projectDir,
         tasksPath,
         verbose: opts.verbose,
-        yes: opts.yes,
-        strictPrereqs: opts.strictPrereqs,
+        autoMode: true,
       });
     }
   );

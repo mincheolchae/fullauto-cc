@@ -82,5 +82,12 @@ export const RunState = z.object({
   passSnapshots: z
     .array(z.object({ pass: z.number(), unresolvedIds: z.array(z.string()) }))
     .default([]),
+  /**
+   * Names of env vars that `auto` mode seeded with placeholder values
+   * (because the user's shell didn't have them). Subagents see
+   * `FULLAUTO_PLACEHOLDER_<NAME>` for each. Surfaced in the final report
+   * so the user knows what to replace before going live.
+   */
+  placeholderEnvs: z.array(z.string()).default([]),
 });
 export type RunState = z.infer<typeof RunState>;

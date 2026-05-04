@@ -189,6 +189,7 @@ async function processOneTask(
     config: state.config,
     projectDir,
     logPath,
+    placeholderEnvs: state.placeholderEnvs,
     onOutput: verbose
       ? (chunk) => chunk.split('\n').forEach((line) => line && printSubagentStreamLine(line))
       : undefined,

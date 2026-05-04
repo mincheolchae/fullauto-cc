@@ -224,9 +224,9 @@ export function extractPrerequisites(source: string): Prerequisite[] {
   const m = source.match(PREREQ_CUTOFF);
   if (!m || m.index === undefined) return [];
   const tail = source.slice(m.index + m[0].length);
-  // Stop at the next H2/H1 header so a hypothetical follow-on section
-  // doesn't get swept in.
-  const nextHeader = tail.search(/^##?\s+\S/m);
+  // Stop at the next markdown header (any depth) — symmetric with the
+  // opener `##+`, so a `### Notes` follow-on doesn't get swept in.
+  const nextHeader = tail.search(/^#+\s+\S/m);
   const sectionBody = nextHeader === -1 ? tail : tail.slice(0, nextHeader);
 
   const prereqs: Prerequisite[] = [];
@@ -248,12 +248,11 @@ export function extractPrerequisites(source: string): Prerequisite[] {
       identifier = rest;
       description = '';
     }
-    // Filter the planner's "None" sentinel — could land in either slot
-    // depending on whether the planner used an em dash separator.
-    if (
-      kind === 'OTHER' &&
-      /^none\b/i.test(identifier || description)
-    ) {
+    // Filter the planner's "None" sentinel regardless of which kind tag it
+    // chose — but ONLY when "None" is the entire payload (optionally with
+    // trailing punctuation). A real description that happens to start with
+    // "None of the existing services support …" must survive.
+    if (/^none[\s.!,]*$/i.test(identifier || description)) {
       continue;
     }
     prereqs.push({ kind, identifier, description });
