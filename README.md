@@ -133,6 +133,132 @@ fullauto init
 > task가 자동 통과되어 도구의 의미가 사라지기 때문. 정말 게이트 없이
 > 돌리고 싶다면 placeholder 하나 넣으세요: `{"name": "noop", "command": "true"}`.
 
+### 백엔드별 셋업 (preset)
+
+`fullauto init --backend <name>`로 백엔드 스택에 맞는 services + 게이트
++ MCP를 한 번에 셋업할 수 있습니다. 기본값은 **convex**입니다:
+
+```bash
+fullauto init                           # convex (default)
+fullauto init --backend convex          # 명시적 동일
+fullauto init --backend supabase
+fullauto init --backend firebase
+fullauto init --backend rest            # 일반 HTTP 백엔드
+fullauto init --backend none            # 백엔드 없음 (frontend-only)
+fullauto init --convex                  # alias for --backend convex
+```
+
+`init`이 자동으로 수행하는 것:
+
+1. `.fullauto/config.json` — services + 게이트 wiring
+2. `.fullauto/mcp.json` — preset에 MCP가 있으면 작성 (Convex / Supabase)
+3. `.env.example` — preset에 필요한 env 변수가 있으면 scaffold
+4. **필요한 env 변수 체크리스트 출력** (어디서 얻는지 포함)
+5. **post-init guidance 출력** — 다음 수동 단계 안내
+6. `package.json` scan해서 다른 preset이 적합해 보이면 hint
+
+| Preset | 핵심 service | MCP | 필수 env (필수만) |
+|---|---|---|---|
+| `convex` (default) | `npx convex dev` | Convex MCP | (대화형 로그인) |
+| `supabase` | `npx supabase start` | Supabase MCP | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` |
+| `firebase` | `npx firebase emulators:start` | (없음) | `FIREBASE_PROJECT_ID` |
+| `rest` | `npm run dev` (편집 필요) | (없음) | (없음, `API_BASE_URL` 권장) |
+| `none` | 없음 | 없음 | 없음 |
+
+> ⚠️ **MCP 명령(`npx -y convex@latest mcp start` 등)은 placeholder입니다.**
+> 본인 환경의 설치된 버전과 entry point에 맞춰 `.fullauto/mcp.json`을
+> 수정해야 할 수 있습니다.
+
+> ⚠️ **preset은 "출발점"입니다.** Supabase/Firebase/REST는 환경별 차이가
+> 커서 (CLI 버전, env 변수 이름, emulator 포트 등) 사용자가 한 번 손봐야
+> 할 가능성이 큽니다. init 출력의 post-init guidance를 따라 진행하세요.
+
+#### 백엔드 사용을 위한 url / key 값 안내 — 4 layer
+
+전체 흐름에서 사용자가 env 값을 놓치지 않도록 **네 시점에 안내**합니다:
+
+1. **`init` 시점**: preset의 requiredEnv 체크리스트 + post-init guidance
+   + `.env.example` 자동 scaffold
+2. **`auto`/`plan` 분해 시점**: planner가 tasks.md 끝에 `## Manual
+   Prerequisites` 섹션으로 작성 (`[ENV] STRIPE_SECRET_KEY — Stripe 키`
+   형식)
+3. **`run` 시작 시점**: TTY면 `[Y/n]` 프롬프트, 누락된 env는 빨간 ✗ 표시
+   (`auto` 모드는 placeholder로 자동 진행)
+4. **run 종료 후**: `auto`가 placeholder로 채운 env 목록을 final report에
+   "교체 필요" 섹션으로 출력
+
+services의 `envFiles`(예: `.env.local`)는 service ready 직후 자동 source
+되어 다음 게이트와 서브에이전트가 그 값을 즉시 사용합니다. `PATH` /
+`LD_PRELOAD` / `NODE_OPTIONS` / `npm_config_*` / `GIT_SSH_COMMAND` /
+`SSH_AUTH_SOCK` 등 program-loader/TLS/패키지/git/SSH 보안에 영향을
+주는 변수 이름은 envFile에서 자동 거부됩니다.
+
+### 게이트 타입
+
+| `type` | 용도 |
+|---|---|
+| `shell` | 셸 명령 실행, exit code로 pass/fail. (기본값 — `type` 생략 가능, 기존 config 그대로 호환) |
+| `http` | URL fetch + status / body 검증. URL에 `${ENV_VAR}` 보간 |
+| `convex-fn` | 프로젝트의 `convex/browser` ConvexHttpClient로 query/mutation/action 직접 호출 + 결과 shape 검증 |
+
+`http`/`convex-fn` 예시:
+
+```json
+{
+  "type": "http", "name": "users-api",
+  "url": "${CONVEX_SITE_URL}/users", "method": "GET",
+  "expectStatus": 200,
+  "expectHeaders": { "content-type": "application/json" },
+  "expectJson": { "length": 1, "0": { "email": "smoke@test.local" } }
+}
+```
+
+(`expectStatus` 단일/배열, `expectBodyContains` 문자열 포함, `expectHeaders`
+헤더 부분문자열 매칭, `expectJson`은 `convex-fn`과 같은 partial deep
+match. 하나라도 실패하면 게이트 실패.)
+
+```json
+{
+  "type": "convex-fn", "name": "create-user",
+  "fn": "users:create", "kind": "mutation",
+  "args": { "email": "smoke@test.local" },
+  "expect": { "shape": { "email": "smoke@test.local" } }
+}
+```
+
+`expect.shape`는 partial deep match — `actual`이 `expected`의 모든 키를
+포함해야 하고, primitive는 `===`, 배열은 동일 길이 + 인덱스 재귀.
+`{ "length": N }` 키는 `actual.length`와 비교 (배열 길이 검증에 유용).
+
+### Services (background processes)
+
+```json
+"services": [
+  { "name": "convex", "command": "npx convex dev",
+    "readyProbe": "test -f .env.local && grep -q CONVEX_URL .env.local",
+    "readyTimeoutSec": 90,
+    "envFiles": [".env.local"] }
+]
+```
+
+- run 시작 시 **순차적으로 spawn** (이전 service의 envFile을 다음 service의 readyProbe가 참조 가능).
+- `readyProbe`(셸 명령)가 exit 0 될 때까지 1초 간격 polling, `readyTimeoutSec` 초과 시 startup 실패로 종료.
+- ready 직후 그 service의 `envFiles` 파싱해서 `process.env`에 머지 (dotenv 형식). `PATH`/`LD_PRELOAD`/`NODE_OPTIONS` 등 program-loader에 영향을 주는 변수는 자동 거부.
+- run 종료 시 SIGTERM (3초 후 SIGKILL). `shutdownCommand` 지정하면 그 명령을 먼저 실행.
+- ready 후 service가 죽으면 다음 task 시작 전에 감지하고 run을 abort (게이트가 connection refused로 무한 반복하는 걸 방지).
+
+> ⚠️ **services는 run 전체 동안 한 번만 띄웁니다 (task 사이 재시작 없음).**
+>
+> 즉 task T001이 만든 DB row가 T002 실행 시점에도 그대로 남아있습니다.
+> JS 테스트 프레임워크의 isolation을 기대하면 안 됩니다. task 사이에
+> 상태를 reset하고 싶으면 `convex-fn` mutation 게이트(예: `_test:reset`)를
+> 게이트 목록 맨 끝에 등록해서 매 task 후 호출되도록 하세요.
+
+> **플랫폼 노트**: macOS / Linux 기준으로 만들어졌습니다. Windows에서는
+> envFile 파서의 케이스 구분(`process.env`가 case-insensitive)과 MCP
+> path 구분자가 POSIX 가정이라 일부 가드가 의도와 다르게 동작할 수
+> 있습니다. WSL이나 Linux 컨테이너 안에서 실행하는 것이 가장 안전합니다.
+
 ---
 
 ## 3. 세 가지 모드

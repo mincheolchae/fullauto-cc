@@ -1,12 +1,20 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { access } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import {
   loadPrerequisitesFromFile,
   loadTasksFromFile,
 } from './parsers/speckit.js';
+import {
+  DEFAULT_PRESET,
+  PRESETS,
+  PRESET_IDS,
+  detectPresetFromPackageJson,
+  type BackendPreset,
+} from './init/presets.js';
+import { expandMcpEnvPlaceholders } from './init/mcp-config.js';
 import {
   ensureFullautoDir,
   loadState,
@@ -37,49 +45,169 @@ program
 
 program
   .command('init')
-  .description('Initialize .fullauto/ in the current directory with a default config.')
+  .description(
+    `Initialize .fullauto/ with a backend preset. Default: ${DEFAULT_PRESET}. Available presets: ${PRESET_IDS.join(', ')}.`
+  )
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
-  .action(async (opts: { dir: string }) => {
-    const projectDir = resolve(opts.dir);
-    await ensureFullautoDir(projectDir);
+  .option(
+    '--backend <preset>',
+    `Backend preset: ${PRESET_IDS.join(' | ')} (default: ${DEFAULT_PRESET}).`,
+    DEFAULT_PRESET
+  )
+  .option(
+    '--convex',
+    'Alias for `--backend convex` (back-compat with earlier versions).',
+    false
+  )
+  .action(
+    async function (
+      this: Command,
+      opts: {
+        dir: string;
+        backend: string;
+        convex: boolean;
+      }
+    ) {
+      const projectDir = resolve(opts.dir);
+      await ensureFullautoDir(projectDir);
 
-    const p = paths(projectDir);
-    if (await fileExists(p.configPath)) {
-      printWarn(`Config already exists: ${p.configPath} — leaving in place.`);
-      return;
+      // `--convex` alias overrides --backend explicitly. Warn if the user
+      // passed both (one says no backend, the other forces convex).
+      if (opts.convex && this.getOptionValueSource('backend') === 'cli') {
+        printWarn(
+          `Both --convex and --backend ${opts.backend} given; --convex wins. Drop one to silence this.`
+        );
+      }
+      const requestedId = opts.convex ? 'convex' : opts.backend;
+      const preset: BackendPreset | undefined = PRESETS[requestedId];
+      if (!preset) {
+        printError(
+          `Unknown backend preset "${requestedId}". Choose one of: ${PRESET_IDS.join(', ')}.`
+        );
+        process.exitCode = 2;
+        return;
+      }
+
+      const p = paths(projectDir);
+
+      // Auto-detect hint: only when the user accepted the default preset
+      // implicitly (no --backend, no --convex). An explicit choice means
+      // they already know what they want — don't second-guess.
+      const backendIsExplicit =
+        this.getOptionValueSource('backend') === 'cli' || opts.convex;
+      if (!backendIsExplicit) {
+        const detected = await detectPresetFromPackageJson(projectDir);
+        if (detected && detected !== preset.id) {
+          printInfo(
+            `Tip: detected "${detected}" SDK in package.json — consider \`fullauto init --backend ${detected}\` (currently using default "${preset.id}").`
+          );
+        }
+      }
+
+      printInfo(`Preset: ${preset.label} — ${preset.description}`);
+
+      // 1. Write config.json (only if absent).
+      const configExisted = await fileExists(p.configPath);
+      if (configExisted) {
+        printWarn(`Config already exists: ${p.configPath} — leaving in place.`);
+      } else {
+        await saveConfigSnapshot(projectDir, preset.buildConfig());
+        printInfo(`Wrote default config: ${p.configPath}`);
+      }
+
+      // 2. Write mcp.json (only if preset specifies one and file absent).
+      const mcpJson = preset.buildMcp();
+      if (mcpJson) {
+        const mcpPath = resolve(projectDir, '.fullauto/mcp.json');
+        if (!(await fileExists(mcpPath))) {
+          // Expand `${VAR}` placeholders in MCP env values at WRITE time —
+          // Claude CLI does NOT interpolate MCP env at spawn time, so the
+          // literal `${SUPABASE_ACCESS_TOKEN}` would be passed to the MCP
+          // server and auth would fail with no clear error.
+          const { expanded, missing } = expandMcpEnvPlaceholders(mcpJson);
+          // Resulting file may contain a real access token → tighten perms.
+          await writeJsonFile(mcpPath, expanded, { mode: 0o600 });
+          printInfo(`Wrote MCP config: ${mcpPath}`);
+          if (missing.length > 0) {
+            printWarn(
+              `MCP env placeholders had no value at init time and were left empty: ${missing.join(', ')}. Set them in your shell and re-run \`fullauto init --backend ${preset.id}\` (after deleting ${mcpPath}) to bake the values in.`
+            );
+          }
+          printWarn(
+            `MCP entry uses "@latest" placeholders — verify the command/version against your installed MCP server before running. Open ${mcpPath} to confirm.`
+          );
+        }
+      }
+
+      // 3. Scaffold .env.example (only if preset specifies and file absent).
+      const envExample = preset.buildEnvExample();
+      if (envExample) {
+        const envExamplePath = resolve(projectDir, '.env.example');
+        if (!(await fileExists(envExamplePath))) {
+          const { writeFile } = await import('node:fs/promises');
+          await writeFile(envExamplePath, envExample, 'utf-8');
+          printInfo(`Scaffolded .env.example — copy to .env.local and fill in values.`);
+        }
+      }
+
+      // 4. Surface required env vars as a checklist the user can act on.
+      printRequiredEnv(preset);
+
+      // 5. Print preset-specific guidance (which CLIs to run, etc).
+      console.log('');
+      for (const line of preset.postInitGuidance().split('\n')) {
+        console.log(`  ${line}`);
+      }
+
+      // 6. Catch the "init basic → init --backend convex" trap.
+      if (configExisted && preset.id !== 'none') {
+        printWarn(
+          `Existing config.json was kept as-is. To wire in this preset's services + mcpConfigPath + example gates, either delete ${p.configPath} and re-run, or manually merge the missing keys.`
+        );
+      }
+
+      printInfo(
+        `Logs and state will live in: ${p.fullautoDir}. Edit the config before running.`
+      );
+
+      const ignoreAdded = await ensureGitignoreEntry(projectDir, '.fullauto/');
+      if (ignoreAdded) {
+        printInfo(`Added \`.fullauto/\` to .gitignore.`);
+      }
     }
+  );
 
-    const defaultConfig = {
-      maxPasses: 2,
-      subagentTimeoutSec: 1800,
-      useReviewLoop: true,
-      gates: [
-        {
-          name: 'typecheck',
-          command: 'npm run typecheck --if-present',
-          skipIf: 'test ! -f package.json',
-        },
-        {
-          name: 'test',
-          command: 'npm test --if-present -- --passWithNoTests',
-          skipIf: 'test ! -f package.json',
-        },
-        {
-          name: 'lint',
-          command: 'npm run lint --if-present',
-          skipIf: 'test ! -f package.json',
-        },
-      ],
-    };
-    await saveConfigSnapshot(projectDir, defaultConfig);
-    printInfo(`Wrote default config: ${p.configPath}`);
-    printInfo(`Edit it before running. Logs and state will live in: ${p.fullautoDir}`);
+function printRequiredEnv(preset: BackendPreset): void {
+  if (preset.requiredEnv.length === 0) return;
+  console.log('');
+  console.log(
+    `Required env vars for the "${preset.label}" preset (set in .env.local or shell):`
+  );
+  for (const e of preset.requiredEnv) {
+    const tag = e.required ? '[REQUIRED]' : '[optional]';
+    console.log(`  ${tag} ${e.name} — ${e.description}`);
+  }
+}
 
-    const ignoreAdded = await ensureGitignoreEntry(projectDir, '.fullauto/');
-    if (ignoreAdded) {
-      printInfo(`Added \`.fullauto/\` to .gitignore.`);
+async function writeJsonFile(
+  absPath: string,
+  value: unknown,
+  opts: { mode?: number } = {}
+): Promise<void> {
+  const { writeFile, mkdir, chmod } = await import('node:fs/promises');
+  await mkdir(dirname(absPath), { recursive: true });
+  await writeFile(absPath, JSON.stringify(value, null, 2) + '\n', 'utf-8');
+  if (opts.mode !== undefined) {
+    try {
+      await chmod(absPath, opts.mode);
+    } catch {
+      // chmod can fail on Windows / unusual filesystems; the JSON is
+      // already written and the rest of the init flow doesn't depend on
+      // the mode change succeeding.
     }
-  });
+  }
+}
+
 
 /**
  * Idempotently ensure `entry` is present in the project's .gitignore. Creates
