@@ -103,7 +103,7 @@ export class TaskQueue {
     );
   }
 
-  private dependenciesSatisfied(task: Task): boolean {
+  dependenciesSatisfied(task: Task): boolean {
     return task.dependencies.every((depId) => {
       const dep = this.byId(depId);
       // Unknown dependency = treat as satisfied (parser may have stripped IDs).

@@ -69,7 +69,47 @@ program
     await saveConfigSnapshot(projectDir, defaultConfig);
     printInfo(`Wrote default config: ${p.configPath}`);
     printInfo(`Edit it before running. Logs and state will live in: ${p.fullautoDir}`);
+
+    const ignoreAdded = await ensureGitignoreEntry(projectDir, '.fullauto/');
+    if (ignoreAdded) {
+      printInfo(`Added \`.fullauto/\` to .gitignore.`);
+    }
   });
+
+/**
+ * Idempotently ensure `entry` is present in the project's .gitignore. Creates
+ * the file if missing. Returns true if a write happened (entry added), false
+ * if it was already present.
+ */
+async function ensureGitignoreEntry(
+  projectDir: string,
+  entry: string
+): Promise<boolean> {
+  const path = resolve(projectDir, '.gitignore');
+  const { readFile, writeFile } = await import('node:fs/promises');
+  let existing = '';
+  try {
+    existing = await readFile(path, 'utf-8');
+  } catch {
+    // .gitignore doesn't exist; we'll create it
+  }
+  const lines = existing.split(/\r?\n/);
+  const normalizedEntry = entry.trim();
+  // Match exact line OR line with the same path but stripped trailing slash —
+  // both `.fullauto` and `.fullauto/` mean the same thing in .gitignore.
+  const alreadyPresent = lines.some((l) => {
+    const t = l.trim();
+    return (
+      t === normalizedEntry ||
+      t === normalizedEntry.replace(/\/$/, '') ||
+      t === `${normalizedEntry.replace(/\/$/, '')}/`
+    );
+  });
+  if (alreadyPresent) return false;
+  const newline = existing.endsWith('\n') || existing === '' ? '' : '\n';
+  await writeFile(path, `${existing}${newline}${normalizedEntry}\n`, 'utf-8');
+  return true;
+}
 
 program
   .command('run')
@@ -98,6 +138,7 @@ program
         printInfo(
           `Existing state found — resuming. Use --force to discard and start fresh.`
         );
+        await reconcileConfigOnResume(projectDir, existing);
         for (const t of existing.tasks) {
           if (t.status === 'in_progress') t.status = 'pending';
         }
@@ -112,6 +153,34 @@ program
       });
     }
   );
+
+/**
+ * On resume, prefer the live `.fullauto/config.json` over the snapshot saved
+ * inside `state.json`. This lets the user edit gates / timeouts / passes
+ * after a crash without having to discard state. If the file changed, log
+ * the diff so the user knows their edits took effect.
+ */
+async function reconcileConfigOnResume(
+  projectDir: string,
+  state: RunState
+): Promise<void> {
+  const liveRaw = await loadUserConfig(projectDir);
+  if (!liveRaw) return;
+  let live: ReturnType<typeof RunConfig.parse>;
+  try {
+    live = RunConfig.parse(liveRaw);
+  } catch {
+    printWarn(
+      `.fullauto/config.json failed to parse on resume — keeping snapshotted config from state.json.`
+    );
+    return;
+  }
+  const snapshotJson = JSON.stringify(state.config);
+  const liveJson = JSON.stringify(live);
+  if (snapshotJson === liveJson) return;
+  state.config = live;
+  printInfo(`Detected edits in .fullauto/config.json — using updated config.`);
+}
 
 /**
  * Common path for "fresh run from a tasks.md file": load the tasks, validate
@@ -306,6 +375,7 @@ program
         printInfo(
           `Existing state found — resuming previous run (description ignored). Use --force to discard and re-plan from scratch.`
         );
+        await reconcileConfigOnResume(projectDir, existing);
         for (const t of existing.tasks) {
           if (t.status === 'in_progress') t.status = 'pending';
         }
@@ -360,6 +430,7 @@ program
     for (const t of state.tasks) {
       if (t.status === 'in_progress') t.status = 'pending';
     }
+    await reconcileConfigOnResume(projectDir, state);
     printResume(paths(projectDir).statePath);
     await runOrchestrator({ projectDir, state, verbose: opts.verbose });
   });

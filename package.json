@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Full-auto orchestrator for Claude Code: sequential task execution with verification gates and self-correcting review loop",
   "type": "module",
-  "license": "MIT",
   "author": "Mincheol Chae <cmc752@gmail.com>",
   "repository": {
     "type": "git",

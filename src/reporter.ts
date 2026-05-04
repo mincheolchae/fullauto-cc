@@ -17,9 +17,20 @@ function color(name: keyof typeof c, s: string): string {
   return process.stdout.isTTY ? `${c[name]}${s}${c.reset}` : s;
 }
 
-export function printPassStart(pass: number, eligibleCount: number): void {
+export function printPassStart(
+  pass: number,
+  readyCount: number,
+  blockedCount: number
+): void {
   console.log('');
-  console.log(color('bold', `=== Pass ${pass} — ${eligibleCount} eligible task(s) ===`));
+  const blockedSuffix =
+    blockedCount > 0 ? `, ${blockedCount} blocked by deps` : '';
+  console.log(
+    color(
+      'bold',
+      `=== Pass ${pass} — ${readyCount} ready task(s)${blockedSuffix} ===`
+    )
+  );
 }
 
 export function printTaskStart(task: Task, attemptNum: number): void {

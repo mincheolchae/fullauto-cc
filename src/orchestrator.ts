@@ -50,12 +50,13 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
       break;
     }
 
-    const eligible = countEligibleInCurrentPass(state);
-    printPassStart(state.currentPass, eligible);
+    const { ready, blocked } = countEligibleInCurrentPass(queue, state);
+    printPassStart(state.currentPass, ready, blocked);
 
-    if (eligible === 0) {
-      // Either nothing in current state matches the pass status filter,
-      // or dependencies are blocking everything. Either way, this pass is done.
+    if (ready === 0) {
+      // Either nothing in current state matches the pass status filter, or
+      // every candidate is dependency-blocked. Either way, no work to do this
+      // pass — advance and let promotion / no-progress detection handle it.
       const advanced = await maybeAdvancePass(queue, state, projectDir);
       if (!advanced) break;
       continue;
@@ -80,14 +81,43 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
     if (!advanced) break;
   }
 
+  // Loop terminated. Anything still `deferred` after maxPasses / no-progress
+  // bail is the orchestrator's terminal failure mode — promote to `failed` so
+  // `isComplete()` reaches true and the final report distinguishes "still
+  // retrying" from "we gave up". Any pending stragglers (shouldn't exist by
+  // here since maybeAdvancePass promotes them, but be defensive) get the same
+  // treatment.
+  for (const t of state.tasks) {
+    if (t.status === 'deferred' || t.status === 'pending') {
+      const last = t.attempts[t.attempts.length - 1];
+      const reasonHint = last?.deferDetail ?? 'never reached a terminal state';
+      t.status = 'failed';
+      const synthetic = attemptFresh(state.currentPass);
+      synthetic.deferReason = last?.deferReason ?? 'unknown';
+      synthetic.deferDetail = `Promoted to failed after orchestrator exit: ${reasonHint}`;
+      synthetic.finishedAt = new Date().toISOString();
+      t.attempts.push(synthetic);
+    }
+  }
+
   await saveState(projectDir, state);
   printFinalReport(state);
   return state;
 }
 
-function countEligibleInCurrentPass(state: RunState): number {
+function countEligibleInCurrentPass(queue: TaskQueue, state: RunState): {
+  ready: number;
+  blocked: number;
+} {
   const targetStatus = state.currentPass === 1 ? 'pending' : 'deferred';
-  return state.tasks.filter((t) => t.status === targetStatus).length;
+  const candidates = state.tasks.filter((t) => t.status === targetStatus);
+  let ready = 0;
+  let blocked = 0;
+  for (const t of candidates) {
+    if (queue.dependenciesSatisfied(t)) ready += 1;
+    else blocked += 1;
+  }
+  return { ready, blocked };
 }
 
 /** Advance to next pass if there's still work to do; returns false if done. */
