@@ -70,19 +70,67 @@ ln -sf "$(pwd)/slash-command/fullauto.md" ~/.claude/commands/fullauto.md
 
 설치 후 Claude Code 세션 어디서나 `/fullauto ...`로 호출 가능합니다.
 
-### 권장: `/verify-loop` 스킬 설치
+### 권장: 동봉된 스킬 설치 (`/verify-loop`, `/vibe-enhance`)
 
-오케스트레이터는 각 서브에이전트에게 자체 교정용으로 `/verify-loop`를
-호출하라고 지시합니다. 스킬이 없으면 단순 self-review로 폴백되어 견고함이
-떨어집니다. `/verify-loop`은 객관 게이트(typecheck/test/lint)와 fresh-context
-리뷰어를 결합하고, 구현자의 intent를 리뷰어에게 전달하며, 재리뷰 시 이전
-BLOCK이 실제로 고쳐졌는지 검증합니다. 이 저장소에 스킬이 함께 들어있으니
+이 저장소는 두 개의 user-invocable Claude Code 스킬을 함께 제공합니다 —
+오케스트레이터가 task별 서브에이전트 안에서 자동으로 사용하기도 하고,
+`/verify-loop` / `/vibe-enhance` 슬래시 커맨드로 직접 호출할 수도 있습니다.
+둘 중 `/verify-loop`은 fullauto가 task 검증용으로 의존하니 거의 필수,
+`/vibe-enhance`는 `--vibe-enhance` 플래그를 켤 때 필요합니다.
+
 심볼릭 링크로 설치:
 
 ```bash
 mkdir -p ~/.claude/skills
-ln -sf "$(pwd)/skills/verify-loop" ~/.claude/skills/verify-loop
+ln -sf "$(pwd)/skills/verify-loop"  ~/.claude/skills/verify-loop
+ln -sf "$(pwd)/skills/vibe-enhance" ~/.claude/skills/vibe-enhance
 ```
+
+#### `/verify-loop` — 검증 루프 (객관 게이트 + 다차원 리뷰어)
+
+구현 → 객관 게이트(typecheck/test/lint) → fresh-context 리뷰어 병렬 spawn
+(correctness/security/design) → BLOCK fix → 다시 게이트 → 다시 리뷰어,
+이렇게 BLOCK이 사라지거나 3 사이클 cap에 닿을 때까지 자체 교정합니다.
+LLM 리뷰만 하는 단순 review-loop보다 강한 이유는 세 가지:
+
+- **객관 게이트가 매 사이클 앞에 들어감** — 깨진 코드를 리뷰어에게 보여주지 않음
+- **구현자의 Intent statement가 모든 리뷰어에 prepend** — "이 endpoint는 의도적으로 public"
+  같은 의도된 design choice를 매 사이클마다 false-positive BLOCK으로 다시 발견하지 않게
+- **사이클 2+ 리뷰어는 직전 BLOCK 리스트를 받음** — 그 자리가 진짜 고쳐졌는지
+  명시적으로 검증 (안 고쳐졌으면 `REGRESSION:` prefix로 BLOCK)
+
+**언제 호출하나** (자동/수동 트리거):
+- fullauto 모든 task 끝에 자동 — 오케스트레이터가 서브에이전트 prompt에 박아둠
+- 사용자 직접 — "꼼꼼히", "production-ready", "신중하게", "검증" 등 신호어가 있거나,
+  auth / payments / schema migration 등 blast radius 큰 변경 시
+- `/review-loop`처럼 사용 — 같은 트리거 phrase 흡수 (이전 이름 호환)
+
+**언제 SKIP되나**: 1~2줄 edit, 문서/typo, 명시적 "빨리"/"대충" 요청 시.
+
+#### `/vibe-enhance` — 트렌드 기반 능동 개선
+
+작업 전 또는 후에 fresh researcher subagent를 spawn해서 **WebSearch로 최근
+12~18개월 업계 트렌드를 조회**하고 프로젝트의 vibe(스택, 컨벤션, 최근
+방향)와 비교합니다. 작은 ENHANCE / FIT-BREAK는 자동 적용하고, 큰 건은
+OPTIONAL로 보고만. 적용한 추가는 `/verify-loop`로 재검증 — 사용자가 안 본
+proactive 변경에 안전망을 거는 형태.
+
+핵심 룰:
+- **No-op도 valid 결과** — 추가할 거 없으면 그냥 통과 ("invent work" 금지)
+- 적용 후 항상 `/verify-loop`로 검증, BLOCK 못 풀면 그 추가만 revert
+- 프로젝트의 명시적 컨벤션이 generic best practice를 이긴다 (README/CLAUDE.md 우선)
+
+**언제 호출하나**:
+- `fullauto run/auto --vibe-enhance` — 한 기능 그룹(=Speckit user story 또는
+  h2 헤더 그룹) 완료마다 자동
+- 사용자 직접 — "트렌드", "최신", "프로젝트와 어울리게", "더 나은 서비스",
+  "한 단계 위로", "production polish" 등의 신호어, 또는 launch/demo/release 직전
+
+**언제 SKIP되나**: 사용자가 "딱 시킨 것만", "scope 최소", "no extras"라고
+명시했거나 trivial edit일 때.
+
+두 스킬 모두 user-invocable이라 fullauto 밖의 다른 프로젝트에서도 그냥
+슬래시 커맨드로 활용 가능합니다.
 
 ---
 
@@ -219,6 +267,40 @@ match. 하나라도 실패하면 게이트 실패.)
 `expect.shape`는 partial deep match — `actual`이 `expected`의 모든 키를
 포함해야 하고, primitive는 `===`, 배열은 동일 길이 + 인덱스 재귀.
 `{ "length": N }` 키는 `actual.length`와 비교 (배열 길이 검증에 유용).
+
+#### 검증 레이어가 셋인 이유 — `npm test`만으로 충분하지 않은가
+
+같은 "API 검증"처럼 보이지만 `shell` 게이트(=`npm test`)와 `http` /
+`convex-fn` 게이트는 **레이어가 다르고 잡는 문제도 다릅니다.**
+
+| 레이어 | 어디서 도나 | 무엇을 잡나 |
+|---|---|---|
+| **typecheck/lint** (shell) | 정적 분석 | 컴파일/문법, 타입 위반 |
+| **`npm test`** (shell) | 테스트 프로세스 안 — 보통 Vitest/Jest의 TestClient, pytest의 FastAPI client 등 (mock 가능) | 비즈니스 로직, edge case, branch coverage |
+| **`http` / `convex-fn`** | 오케스트레이터가 직접 호출 → **실제 떠있는 service**(`services` 배열에서 spawn된 dev 서버 / convex / supabase) 대상 | 배포 레벨 문제 — env var 누락, service 안 뜸, 컨트랙트 위반, JSON 형태 불일치, CORS / auth 헤더 |
+
+`http` 게이트가 잡지만 `npm test`는 못 잡는 시나리오:
+- **Env var 누락**: 테스트는 mock으로 우회해서 통과, 실제 dev 서버는 `DATABASE_URL` 미설정으로 500
+- **Service가 죽어있음**: 테스트는 자체 server 띄워 통과, 진짜 `convex dev`는 안 뜬 상태
+- **외부 contract**: 테스트는 본인 코드만 검증, 외부 클라이언트가 보는 status/JSON shape는 다를 수 있음
+- **언어 무관**: monorepo에서 백엔드 Go + 프론트 TS면 `npm test`는 TS만 돔; `http`는 양쪽 다 두드림
+- **테스트 슈트가 빈약**: 작은 프로젝트라 본격 슈트 없을 때 5줄 게이트로 핵심 endpoint 스모크
+
+즉 `http`/`convex-fn`은 "코드는 맞는데 배포는 깨진" 케이스 catch용 안전망입니다.
+이걸 활용하려면 **default config에 들어있는 게이트 외에 본인 도메인 endpoint를
+직접 추가**해야 합니다 — preset이 까는 건 출발점일 뿐이고 (`/health`, REST root,
+emulator 포트 등 liveness만), 실제 비즈니스 endpoint는 사용자 책임입니다.
+
+POST + JSON shape 검증 예시:
+
+```json
+{ "type": "http", "name": "user-create",
+  "url": "${API_BASE_URL}/api/users", "method": "POST",
+  "headers": { "content-type": "application/json" },
+  "body": "{\"email\":\"smoke@test.local\"}",
+  "expectStatus": [200, 201],
+  "expectJson": { "email": "smoke@test.local" } }
+```
 
 ### Services (background processes)
 
