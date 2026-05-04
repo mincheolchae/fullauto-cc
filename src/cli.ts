@@ -2,7 +2,6 @@
 import { Command } from 'commander';
 import { dirname, resolve } from 'node:path';
 import { access } from 'node:fs/promises';
-import { createInterface } from 'node:readline';
 import {
   loadPrerequisitesFromFile,
   loadTasksFromFile,
@@ -255,10 +254,9 @@ program
     'Overwrite existing state.json (otherwise refuses if a run is in progress)',
     false
   )
-  .option('-y, --yes', 'Skip the manual-prerequisites confirmation prompt', false)
   .option(
     '--strict-prereqs',
-    'In non-interactive mode, abort if any [ENV] prerequisite is unset',
+    'Abort if any [ENV] prerequisite is unset (otherwise: warn and proceed)',
     false
   )
   .option(
@@ -273,7 +271,6 @@ program
         dir: string;
         verbose: boolean;
         force: boolean;
-        yes: boolean;
         strictPrereqs: boolean;
         vibeEnhance: boolean;
       }
@@ -289,9 +286,9 @@ program
         printInfo(
           `Existing state found — resuming. Use --force to discard and start fresh.`
         );
-        if (opts.yes || opts.strictPrereqs) {
+        if (opts.strictPrereqs) {
           printWarn(
-            `--yes / --strict-prereqs only apply to a fresh run — ignored on resume.`
+            `--strict-prereqs only applies to a fresh run — ignored on resume.`
           );
         }
         if (opts.vibeEnhance) {
@@ -311,7 +308,6 @@ program
         projectDir,
         tasksPath: resolve(tasksFile),
         verbose: opts.verbose,
-        yes: opts.yes,
         strictPrereqs: opts.strictPrereqs,
         vibeEnhance: opts.vibeEnhance,
       });
@@ -358,12 +354,11 @@ async function startFreshRun(args: {
   projectDir: string;
   tasksPath: string;
   verbose: boolean;
-  yes?: boolean;
   strictPrereqs?: boolean;
   /**
-   * `auto` mode is non-interactive by design: instead of prompting the user
-   * to fix missing env vars, we surface the checklist, seed placeholder
-   * values for any unset [ENV] items, and report them at run end.
+   * `auto` mode seeds placeholder values for unset [ENV] items so subagents
+   * can still spawn and the run is reported at end; `run` mode just warns
+   * about missing env vars and proceeds. Neither mode prompts the user.
    */
   autoMode?: boolean;
   /** CLI-level override for config.vibeEnhance. When true, force-enable. */
@@ -394,16 +389,15 @@ async function startFreshRun(args: {
     `Loaded ${tasks.length} task(s) from ${tasksPath}. Project: ${projectDir}`
   );
 
-  // In `run` mode (interactive by intent): surface prereqs and ask the user
-  // to confirm. In `auto` mode (non-interactive by intent): surface them
-  // as an FYI but proceed unconditionally, seeding placeholder values for
-  // missing env vars so subagents can still execute.
+  // Surface manual prerequisites then proceed without prompting. `auto` mode
+  // additionally seeds placeholder env values so subagents can still spawn
+  // even when real credentials aren't set; `run` mode only refuses to start
+  // when --strict-prereqs is set AND a [ENV] prereq is unset.
   let placeholderEnvs: string[] = [];
   if (autoMode) {
     placeholderEnvs = await collectPlaceholderEnvs(tasksPath);
   } else {
     const proceed = await surfacePrerequisites(tasksPath, {
-      skipConfirm: args.yes ?? false,
       strict: args.strictPrereqs ?? false,
     });
     if (!proceed) return false;
@@ -716,76 +710,45 @@ async function fileExists(path: string): Promise<boolean> {
 }
 
 /**
- * Read tasks file, surface its Manual Prerequisites section, optionally
- * prompt the user to confirm. Returns true if the caller should proceed.
+ * Read tasks file, surface its Manual Prerequisites section, then proceed
+ * without prompting. The orchestrator never asks the user "continue?" —
+ * the design choice is that runs go through unattended so CI / pipelines
+ * / overnight runs don't deadlock at a TTY-only prompt.
  *
  * Behavior:
  *  - No prereqs in the file → silent passthrough, returns true.
- *  - Prereqs present + interactive (TTY) + !skipConfirm → prompt [Y/n].
- *  - Prereqs present + non-TTY → print and proceed (so CI / piped use isn't
- *    silently blocked). User can opt into hard-stop with --strict-prereqs.
- *  - skipConfirm (--yes) → print and proceed regardless.
+ *  - Prereqs present → print the checklist, then return true (proceed).
+ *  - `--strict-prereqs` AND missing [ENV] items → return false (refuse to
+ *    start). This is the only way the call ever returns false.
+ *
+ * Missing env vars during the run will surface as gate failures or
+ * subagent errors, which the orchestrator's normal defer/retry loop
+ * handles. `auto` mode additionally seeds placeholder values and reports
+ * them at run end.
  */
 async function surfacePrerequisites(
   tasksPath: string,
-  opts: { skipConfirm: boolean; strict: boolean }
+  opts: { strict: boolean }
 ): Promise<boolean> {
   const prereqs = await loadPrerequisitesFromFile(tasksPath);
   if (prereqs.length === 0) return true;
 
   const { missingEnvCount } = printPrerequisites(prereqs);
 
-  if (opts.skipConfirm) {
-    if (missingEnvCount > 0) {
-      printWarn(
-        `Proceeding despite ${missingEnvCount} unset env var(s) (--yes).`
-      );
-    }
-    return true;
-  }
-
-  const isInteractive = process.stdin.isTTY && process.stdout.isTTY;
-  if (!isInteractive) {
-    if (opts.strict && missingEnvCount > 0) {
-      printError(
-        `--strict-prereqs and ${missingEnvCount} unset env var(s) — refusing to start.`
-      );
-      process.exitCode = 2;
-      return false;
-    }
-    printInfo(
-      `Non-interactive shell detected — continuing without confirmation.`
+  if (opts.strict && missingEnvCount > 0) {
+    printError(
+      `--strict-prereqs and ${missingEnvCount} unset env var(s) — refusing to start.`
     );
-    return true;
-  }
-
-  const answer = await prompt(
-    missingEnvCount > 0
-      ? `\nContinue anyway? Missing env vars will likely fail at runtime. [y/N] `
-      : `\nContinue with the run? [Y/n] `
-  );
-  const defaultYes = missingEnvCount === 0;
-  const proceed = defaultYes
-    ? !/^n(o)?$/i.test(answer.trim())
-    : /^y(es)?$/i.test(answer.trim());
-  if (!proceed) {
-    printInfo(`Aborted by user. No state changes were made.`);
+    process.exitCode = 2;
     return false;
   }
-  return true;
-}
 
-function prompt(question: string): Promise<string> {
-  return new Promise((resolve) => {
-    const rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer);
-    });
-  });
+  if (missingEnvCount > 0) {
+    printWarn(
+      `Proceeding with ${missingEnvCount} unset env var(s) — they will likely surface as gate failures.`
+    );
+  }
+  return true;
 }
 
 program.parseAsync(process.argv).catch((err) => {

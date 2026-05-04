@@ -336,8 +336,8 @@ function buildEnhanceTask(
   // Match the queue's pass-aware status filter: pass 1 looks for 'pending',
   // pass >= 2 looks for 'deferred'. If we set status='pending' while
   // currentPass=2, queue.next() never picks it and end-of-pass promotion
-  // turns it into 'deferred' for pass 3 — which under default maxPasses=2
-  // means it never runs.
+  // turns it into 'deferred' for the next pass — which under a low
+  // maxPasses (e.g. user-overridden to 1) could mean it never runs.
   const status = currentPass === 1 ? 'pending' : 'deferred';
   return {
     id,

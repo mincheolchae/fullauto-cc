@@ -63,7 +63,7 @@ const COMMON_GATES = [
 ];
 
 const BASE_CONFIG_SHELL_ONLY: Record<string, unknown> = {
-  maxPasses: 2,
+  maxPasses: 3,
   subagentTimeoutSec: 1800,
   useVerifyLoop: true,
   services: [],
@@ -100,7 +100,7 @@ const CONVEX: BackendPreset = {
     },
   ],
   buildConfig: () => ({
-    maxPasses: 2,
+    maxPasses: 3,
     subagentTimeoutSec: 1800,
     useVerifyLoop: true,
     mcpConfigPath: '.fullauto/mcp.json',
@@ -184,7 +184,7 @@ const SUPABASE: BackendPreset = {
     },
   ],
   buildConfig: () => ({
-    maxPasses: 2,
+    maxPasses: 3,
     subagentTimeoutSec: 1800,
     useVerifyLoop: true,
     mcpConfigPath: '.fullauto/mcp.json',
@@ -288,7 +288,7 @@ const FIREBASE: BackendPreset = {
     },
   ],
   buildConfig: () => ({
-    maxPasses: 2,
+    maxPasses: 3,
     subagentTimeoutSec: 1800,
     useVerifyLoop: true,
     services: [
@@ -356,7 +356,7 @@ const REST: BackendPreset = {
     },
   ],
   buildConfig: () => ({
-    maxPasses: 2,
+    maxPasses: 3,
     subagentTimeoutSec: 1800,
     useVerifyLoop: true,
     services: [

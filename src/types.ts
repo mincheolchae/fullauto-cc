@@ -188,8 +188,17 @@ export const Gate = z.preprocess(
 export type Gate = z.infer<typeof Gate>;
 
 export const RunConfig = z.object({
-  /** Max passes through the queue before escalating to user (default: 2). */
-  maxPasses: z.number().int().positive().default(2),
+  /**
+   * Max passes through the queue before escalating to user (default: 3).
+   *
+   * Each pass re-attempts whatever's still deferred. The orchestrator
+   * also exits early via `noProgressInCurrentPass` when a pass starts
+   * and ends with the same unresolved set, so this value caps the
+   * convergence budget without forcing wasted work — `3` is essentially
+   * "two retries past the initial attempt," which covers two-level
+   * dependency-chain retries and one stochastic-flake retry.
+   */
+  maxPasses: z.number().int().positive().default(3),
   /** Per-task subagent timeout in seconds (default: 1800 = 30min). */
   subagentTimeoutSec: z.number().int().positive().default(1800),
   /** Whether to instruct the implementer subagent to invoke /verify-loop. */
