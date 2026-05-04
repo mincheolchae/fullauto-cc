@@ -121,20 +121,13 @@ const CONVEX: BackendPreset = {
         command: 'npx convex codegen',
         skipIf: 'test ! -d convex',
       },
-      // Example convex-fn gate — REPLACE with a real query/mutation from
-      // your convex/ directory. The convex-fn gate auto-resolves the
-      // deployment URL across CONVEX_URL / NEXT_PUBLIC_CONVEX_URL /
-      // VITE_CONVEX_URL so it works regardless of which framework wrote
-      // .env.local. (We deliberately do NOT ship a default http gate
-      // hard-coded to a single env var name — it would silently fail on
-      // Next.js stacks where only the NEXT_PUBLIC_ form is set.)
-      {
-        type: 'convex-fn',
-        name: 'example-query',
-        fn: 'health:ping',
-        kind: 'query',
-        args: {},
-      },
+      // No convex-fn gate is shipped by default. The service readyProbe
+      // confirms `convex dev` is up and `convex-codegen` validates function
+      // code; a placeholder convex-fn gate (e.g. `health:ping`) would just
+      // fail until the user edits it, defeating the goal of zero-touch init.
+      // Add convex-fn gates as your real queries/mutations come online —
+      // the gate auto-resolves the deployment URL across
+      // CONVEX_URL / NEXT_PUBLIC_CONVEX_URL / VITE_CONVEX_URL.
     ],
   }),
   buildMcp: () => ({
@@ -151,8 +144,8 @@ const CONVEX: BackendPreset = {
     [
       'Convex preset wired up. Next:',
       '  1. Run `npx convex dev` once interactively — it will prompt to login + create a dev deployment, then write CONVEX_URL to .env.local.',
-      '  2. Replace `health:ping` in the example gate with a real query/mutation from your convex/ directory.',
-      '  3. Verify the MCP entry in .fullauto/mcp.json matches your installed convex version.',
+      '  2. Verify the MCP entry in .fullauto/mcp.json matches your installed convex version.',
+      '  3. (Optional) Add convex-fn gates to .fullauto/config.json as real queries/mutations come online — see README §2 "검증 레이어가 셋인 이유".',
     ].join('\n'),
 };
 
