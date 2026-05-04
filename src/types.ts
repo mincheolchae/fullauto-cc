@@ -10,7 +10,7 @@ export const TaskStatus = z.enum([
 export type TaskStatus = z.infer<typeof TaskStatus>;
 
 export const DeferReason = z.enum([
-  'review_loop_blocks_remaining',
+  'verify_loop_blocks_remaining',
   'gate_failed',
   'subagent_error',
   'depends_on_unfinished_task',
@@ -192,15 +192,15 @@ export const RunConfig = z.object({
   maxPasses: z.number().int().positive().default(2),
   /** Per-task subagent timeout in seconds (default: 1800 = 30min). */
   subagentTimeoutSec: z.number().int().positive().default(1800),
-  /** Whether to instruct the implementer subagent to invoke /review-loop. */
-  useReviewLoop: z.boolean().default(true),
+  /** Whether to instruct the implementer subagent to invoke /verify-loop. */
+  useVerifyLoop: z.boolean().default(true),
   /**
    * If true, the orchestrator injects a synthetic `enhance` task after each
    * feature group's user tasks complete. That task spawns a Claude subagent
    * which invokes the /vibe-enhance skill — a fresh researcher subagent
    * compares the just-completed work against latest trends and applies any
    * scoped FIT-BREAK / ENHANCE additions, then routes them through
-   * /review-loop. Failed enhance tasks defer like any other task.
+   * /verify-loop. Failed enhance tasks defer like any other task.
    *
    * No h2 headings in tasks.md = one implicit feature spanning the whole run,
    * so this gives a single end-of-run pass for the auto-mode case where the

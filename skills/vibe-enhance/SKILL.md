@@ -1,6 +1,6 @@
 ---
 name: vibe-enhance
-description: Proactive project-fit + trend-check skill. Before or after a task, spawns an independent researcher subagent (fresh context, WebSearch enabled) that (1) absorbs the project's vibe — stack, conventions, recent direction — (2) compares the current or planned work against latest industry trends and best practices, and (3) recommends additions or refinements the user did NOT explicitly ask for but would meaningfully improve the product. The implementer (you) applies the high-value recommendations, then chains the additions through `/review-loop` for verification. TRIGGER when the user signals they want trend-aware or above-and-beyond work — phrases like "트렌드", "최신 트렌드", "분위기에 맞나", "프로젝트와 어울리게", "더 나은 서비스", "한 단계 위로", "개선 여지", "벤치마크", "industry standard", "best practices", "above and beyond", "proactive enhance", or when the user explicitly invokes `/vibe-enhance`. Also TRIGGER when delivering a feature where the user has expressed interest in product polish (launch, demo, public release). SKIP for trivial edits, exploratory/throwaway code, when the user says "딱 시킨 것만", "scope 최소", "no extras", "빨리", "quickly", or when the user has explicitly opted out of scope expansion.
+description: Proactive project-fit + trend-check skill. Before or after a task, spawns an independent researcher subagent (fresh context, WebSearch enabled) that (1) absorbs the project's vibe — stack, conventions, recent direction — (2) compares the current or planned work against latest industry trends and best practices, and (3) recommends additions or refinements the user did NOT explicitly ask for but would meaningfully improve the product. The implementer (you) applies the high-value recommendations, then chains the additions through `/verify-loop` for verification. TRIGGER when the user signals they want trend-aware or above-and-beyond work — phrases like "트렌드", "최신 트렌드", "분위기에 맞나", "프로젝트와 어울리게", "더 나은 서비스", "한 단계 위로", "개선 여지", "벤치마크", "industry standard", "best practices", "above and beyond", "proactive enhance", or when the user explicitly invokes `/vibe-enhance`. Also TRIGGER when delivering a feature where the user has expressed interest in product polish (launch, demo, public release). SKIP for trivial edits, exploratory/throwaway code, when the user says "딱 시킨 것만", "scope 최소", "no extras", "빨리", "quickly", or when the user has explicitly opted out of scope expansion.
 user-invocable: true
 allowed-tools:
   - Agent
@@ -18,7 +18,7 @@ allowed-tools:
 
 # /vibe-enhance — 프로젝트 분위기 점검 & 트렌드 기반 능동 개선
 
-A loop where a fresh researcher subagent — equipped with WebSearch — reads the project, absorbs its vibe, compares current work against the latest industry direction, and proposes high-value additions. You (the implementer) apply the proposals that are clearly worth it, then verify the new work through `/review-loop`.
+A loop where a fresh researcher subagent — equipped with WebSearch — reads the project, absorbs its vibe, compares current work against the latest industry direction, and proposes high-value additions. You (the implementer) apply the proposals that are clearly worth it, then verify the new work through `/verify-loop`.
 
 ## When this skill is active
 
@@ -86,21 +86,21 @@ Otherwise, for each FIT-BREAK and ENHANCE you decide to apply:
 2. Keep each addition independently revertible — discrete, scoped edits, never mixed with unrelated changes. The user must be able to revert any single addition cleanly from the report alone.
 3. Do not bundle OPTIONAL items into this step. Those go to the final report only — OPTIONAL is the bucket for changes too large or opinionated for the implicit approval this skill carries.
 
-The accountability for unrequested work happens in Phase G (thorough report) and Phase F (review-loop), not in a pre-apply prompt.
+The accountability for unrequested work happens in Phase G (thorough report) and Phase F (verify-loop), not in a pre-apply prompt.
 
-## Phase F — Verify additions via /review-loop
+## Phase F — Verify additions via /verify-loop
 
 The whole point of this skill is to add work the user did not explicitly ask for. That added work must clear a higher correctness bar than work the user already saw in conversation, because they have not yet seen it.
 
-After Phase E completes, **invoke `/review-loop`** on the additions:
+After Phase E completes, **invoke `/verify-loop`** on the additions:
 
 ```
-Skill(skill: "review-loop", args: "vibe-enhance가 방금 추가한 작업 검증: <touched files>")
+Skill(skill: "verify-loop", args: "vibe-enhance가 방금 추가한 작업 검증: <touched files>")
 ```
 
-Pass the list of files touched in Phase E. The review-loop will run fresh-eyes correctness/security review and surface any BLOCKs.
+Pass the list of files touched in Phase E. The verify-loop will run fresh-eyes correctness/security review and surface any BLOCKs.
 
-If review-loop flags BLOCKs you cannot resolve cleanly within one fix cycle, **revert that specific addition** rather than shipping a half-fixed proactive change. Proactive work that introduces bugs is worse than no proactive work.
+If verify-loop flags BLOCKs you cannot resolve cleanly within one fix cycle, **revert that specific addition** rather than shipping a half-fixed proactive change. Proactive work that introduces bugs is worse than no proactive work.
 
 If you applied no additions in Phase E, skip Phase F.
 
@@ -139,7 +139,7 @@ Pick the matching template.
 🔭 트렌드 노트 (참고만, n개):
 - <한 줄> · <source URL>
 
-🛡️ review-loop 결과: <BLOCK n / WARN n / INFO n>
+🛡️ verify-loop 결과: <BLOCK n / WARN n / INFO n>
 - <BLOCK이 있었다면 어떻게 처리했는지 — 수정 / 해당 추가만 revert>
 
 다음 행동: <권장 조치 1줄, 또는 "그대로 마무리해도 됩니다. 마음에 들지 않으면 위 '되돌리려면' 줄 참고하세요.">
@@ -223,8 +223,8 @@ If you found nothing actionable, say exactly: "No actionable suggestions — cur
 - **Researcher does not write or edit.** Read-only + web-only. The implementer (you) holds the only pen.
 - **Filter aggressively at Phase D.** WebSearch-equipped agents over-suggest novelty. The bar is "clearly fits THIS project as it exists today," not "matches the latest hype."
 - **Auto-apply only small, low-risk ENHANCEs and clear FIT-BREAKs.** Anything larger surfaces to the user as OPTIONAL.
-- **Always chain into `/review-loop` after Phase E.** Proactive additions the user hasn't seen need extra scrutiny — that's the safety net for autonomous scope expansion.
-- **If `/review-loop` BLOCKs a proactive addition you can't cleanly fix in one cycle, revert that addition.** Do not ship half-fixed scope expansion.
+- **Always chain into `/verify-loop` after Phase E.** Proactive additions the user hasn't seen need extra scrutiny — that's the safety net for autonomous scope expansion.
+- **If `/verify-loop` BLOCKs a proactive addition you can't cleanly fix in one cycle, revert that addition.** Do not ship half-fixed scope expansion.
 - **Skip the skill** for changes too small or too exploratory to warrant trend research. Tell the user "이 정도 변경에는 vibe-enhance 비용이 과합니다 — 그냥 진행하겠습니다" and proceed normally.
 - **Do not paste researcher output to the user.** Summarize.
 - **Respect explicit opt-outs.** If the user said "딱 시킨 것만" or "no extras" earlier in the conversation, do not run this skill even if a trigger phrase appears later.

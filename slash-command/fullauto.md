@@ -18,7 +18,7 @@ Two modes, dispatched automatically by the bash block below:
 | `/fullauto path/to/tasks.md` | **run mode** | Parses the file, runs the orchestrator. |
 | `/fullauto implement user CRUD endpoints` | **auto mode** | First spawns a planner subagent to decompose the description into `.fullauto/auto-tasks.md`, then runs the orchestrator on it. |
 
-Both modes use the same per-task pipeline: each task runs in a fresh `claude -p` subagent (with `/review-loop` available), then verification gates (typecheck/test/lint) decide `done` vs `deferred`. Deferred tasks retry on a second pass; anything still unresolved is reported with reasons and log paths.
+Both modes use the same per-task pipeline: each task runs in a fresh `claude -p` subagent (with `/verify-loop` available), then verification gates (typecheck/test/lint) decide `done` vs `deferred`. Deferred tasks retry on a second pass; anything still unresolved is reported with reasons and log paths.
 
 Append `--vibe-enhance` to either form to layer on a proactive trend-check + improvement pass — see "Vibe-enhance modes" below.
 
@@ -35,7 +35,7 @@ Put the file path or description FIRST, flags after. `/fullauto --vibe-enhance t
 
 ## Vibe-enhance modes
 
-Both run-mode and auto-mode accept `--vibe-enhance`, which layers a proactive improvement pass on top of the normal per-task pipeline. The pass is implemented by the `/vibe-enhance` skill — a fresh researcher subagent (with WebSearch) compares the just-completed work against latest trends, applies scoped FIT-BREAK / ENHANCE additions, and routes those additions through `/review-loop` for verification. The pass enforces "no-op is a valid outcome" — if nothing's worth adding, the run continues without scope creep.
+Both run-mode and auto-mode accept `--vibe-enhance`, which layers a proactive improvement pass on top of the normal per-task pipeline. The pass is implemented by the `/vibe-enhance` skill — a fresh researcher subagent (with WebSearch) compares the just-completed work against latest trends, applies scoped FIT-BREAK / ENHANCE additions, and routes those additions through `/verify-loop` for verification. The pass enforces "no-op is a valid outcome" — if nothing's worth adding, the run continues without scope creep.
 
 | Form | Granularity | Example |
 |---|---|---|
@@ -96,5 +96,5 @@ After the bash block exits, summarize the final report to the user — note any 
 - Auto mode writes the planner output to `.fullauto/auto-tasks.md`. You can review/edit that file and re-run with `fullauto run .fullauto/auto-tasks.md` if you want to adjust the breakdown before execution.
 - If the planner is too unsure to decompose, it writes `AMBIGUOUS: <one specific question>` into the output file and the orchestrator surfaces the question. Re-issue `/fullauto` with a more detailed description.
 - If `.fullauto/state.json` already exists from a prior run (crashed or in-progress), `fullauto run` and `fullauto auto` both auto-resume from it — re-issuing `/fullauto` after a crash continues from where you stopped. Pass `--force` to discard and start fresh.
-- The orchestrator runs `claude -p` itself for each task — those run with `acceptEdits` permission mode and inherit the user's existing skills (including `/review-loop`) automatically.
+- The orchestrator runs `claude -p` itself for each task — those run with `acceptEdits` permission mode and inherit the user's existing skills (including `/verify-loop`) automatically.
 - Manual prerequisites (env vars, CLI logins, billing setup, etc.) declared by the planner are surfaced before the run starts, with `[ENV]` items cross-checked against the current shell. Inside Claude Code the Bash environment is non-interactive, so the orchestrator prints the checklist and proceeds — surface it to the user yourself if any `[ENV]` items show `✗ NOT SET` so they know what to export before re-running.

@@ -408,7 +408,7 @@ async function processOneTask(
     // Trust the early-defer hint to avoid wasting gate time when the
     // subagent already knows the work is incomplete. A forged DEFER only
     // costs a re-attempt next pass, never a false success.
-    deferTask(task, attempt, 'review_loop_blocks_remaining', verdict.deferReason ?? 'subagent requested defer');
+    deferTask(task, attempt, 'verify_loop_blocks_remaining', verdict.deferReason ?? 'subagent requested defer');
     printTaskDeferred(task, attempt.deferDetail!, []);
     return;
   }

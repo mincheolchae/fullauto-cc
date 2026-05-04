@@ -46,7 +46,7 @@ export interface SpawnOptions {
  * over a just-completed feature group. The subagent doesn't implement
  * anything itself; it invokes the /vibe-enhance skill, which spawns a fresh
  * researcher, triages findings, applies scoped additions, and chains into
- * /review-loop. Same DEFER protocol so a skipped/no-op outcome doesn't fail
+ * /verify-loop. Same DEFER protocol so a skipped/no-op outcome doesn't fail
  * the run.
  *
  * `task.body` is expected to contain a markdown bullet list of completed
@@ -73,12 +73,12 @@ export function buildEnhanceSubagentPrompt(task: Task): string {
     ``,
     `## What to do`,
     `1. Invoke the /vibe-enhance skill in post-work mode. Pass it the feature label and the task list above as context.`,
-    `2. Let /vibe-enhance run its full flow: spawn a fresh researcher subagent (with WebSearch), triage findings, apply only FIT-BREAK and small ENHANCE additions, and chain into /review-loop on whatever it added.`,
+    `2. Let /vibe-enhance run its full flow: spawn a fresh researcher subagent (with WebSearch), triage findings, apply only FIT-BREAK and small ENHANCE additions, and chain into /verify-loop on whatever it added.`,
     `3. Honor the skill's "no-op is a valid outcome" rule. If the researcher returns nothing actionable, finish with that outcome cleanly. Do NOT invent additions to justify the pass.`,
     `4. Do not modify code outside what /vibe-enhance directs you to apply. No opportunistic refactors, no scope creep into the next feature group.`,
     ``,
     `## Output protocol`,
-    `If the /vibe-enhance pass cannot run (skill missing, /review-loop blocked an addition you can't fix, environmental issue), end your final message with this line on its own:`,
+    `If the /vibe-enhance pass cannot run (skill missing, /verify-loop blocked an addition you can't fix, environmental issue), end your final message with this line on its own:`,
     ``,
     `   FULLAUTO_RESULT: DEFER <one-line reason>`,
     ``,
@@ -91,7 +91,7 @@ export function buildEnhanceSubagentPrompt(task: Task): string {
  *
  * Constraints we enforce by prompt:
  *  - Work on ONE task only (no scope creep into other tasks).
- *  - Must invoke /review-loop before declaring done (when enabled).
+ *  - Must invoke /verify-loop before declaring done (when enabled).
  *  - On unrecoverable obstacle, output a structured DEFER marker so the
  *    orchestrator can mark the task `deferred` instead of `failed`.
  */
@@ -100,8 +100,8 @@ export function buildSubagentPrompt(
   config: RunConfig,
   placeholderEnvs: string[] = []
 ): string {
-  const reviewLoopInstruction = config.useReviewLoop
-    ? `When the implementation compiles and the smoke path works, invoke the /review-loop skill to spawn fresh-context reviewer subagents. Address every BLOCK-level finding before finishing. WARN/INFO findings should be reported in your final message but not auto-fixed.`
+  const verifyLoopInstruction = config.useVerifyLoop
+    ? `When the implementation compiles and the smoke path works, invoke the /verify-loop skill to run objective gates (typecheck/test/lint) and spawn fresh-context reviewer subagents. Address every BLOCK-level finding before finishing. WARN/INFO findings should be reported in your final message but not auto-fixed.`
     : `When the implementation compiles and the smoke path works, perform a self-review pass: re-read each changed file with fresh eyes and fix any obvious bugs, then proceed.`;
 
   const placeholderBlock = placeholderEnvs.length
@@ -138,12 +138,12 @@ export function buildSubagentPrompt(
     ``,
     `## Rules`,
     `1. Implement only what this task describes. If you discover a missing prerequisite that belongs to another task, STOP and emit the DEFER marker described below — do not invent a workaround.`,
-    `2. ${reviewLoopInstruction}`,
+    `2. ${verifyLoopInstruction}`,
     `3. Do not run \`git commit\`, \`git push\`, or any destructive shell command unless the task explicitly requires it.`,
     `4. Verification gates (typecheck/test/lint) are run by the orchestrator AFTER you finish — you do not need to invoke them yourself, but your code must pass them.`,
     ``,
     `## Output protocol`,
-    `If you cannot complete this task — missing prerequisite, environmental issue, unresolved BLOCK from /review-loop — end your final message with this line on its own:`,
+    `If you cannot complete this task — missing prerequisite, environmental issue, unresolved BLOCK from /verify-loop — end your final message with this line on its own:`,
     ``,
     `   FULLAUTO_RESULT: DEFER <one-line reason>`,
     ``,
