@@ -50,6 +50,121 @@ export const Task = z.object({
 });
 export type Task = z.infer<typeof Task>;
 
+/**
+ * A long-running background process the orchestrator boots before the first
+ * task and tears down at run end (e.g. `npx convex dev`, `next dev`, an
+ * iOS simulator). Gates can probe these services via http / convex-fn.
+ */
+export const ServiceDef = z.object({
+  name: z.string(),
+  command: z.string(),
+  cwd: z.string().optional(),
+  /** Extra env vars to merge on top of process.env for THIS service only. */
+  env: z.record(z.string()).optional(),
+  /**
+   * Shell command that exits 0 when the service is ready. Polled every 1s
+   * until it succeeds or readyTimeoutSec elapses (after which startup fails).
+   * Omit to mark "ready immediately after spawn" (rare).
+   */
+  readyProbe: z.string().optional(),
+  readyTimeoutSec: z.number().int().positive().default(60),
+  /** Optional explicit cleanup command. If absent, SIGTERM is sent. */
+  shutdownCommand: z.string().optional(),
+  /**
+   * After ready, parse these dotenv-style files and merge their values into
+   * `process.env` so subsequent gates / subagents see them. `convex dev`
+   * writes `CONVEX_URL` to `.env.local` — list it here to surface that var.
+   */
+  envFiles: z.array(z.string()).default([]),
+});
+export type ServiceDef = z.infer<typeof ServiceDef>;
+
+const ShellGate = z.object({
+  type: z.literal('shell').default('shell'),
+  name: z.string(),
+  command: z.string(),
+  cwd: z.string().optional(),
+  skipIf: z.string().optional(),
+  /** Per-gate timeout override; default 600s (10 min). */
+  timeoutSec: z.number().int().positive().optional(),
+});
+export type ShellGate = z.infer<typeof ShellGate>;
+
+const HttpGate = z.object({
+  type: z.literal('http'),
+  name: z.string(),
+  /** May contain `${ENV_VAR}` placeholders interpolated from process.env. */
+  url: z.string(),
+  method: z
+    .enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'])
+    .default('GET'),
+  headers: z.record(z.string()).default({}),
+  body: z.string().optional(),
+  /** Default: any 2xx counts as pass. */
+  expectStatus: z.union([z.number(), z.array(z.number())]).optional(),
+  /** Substring that must appear in the response body for pass. */
+  expectBodyContains: z.string().optional(),
+  /**
+   * Parse the response body as JSON and partial-deep-match against this
+   * shape. Same matcher used by `convex-fn` — see `matchShape` in
+   * `runner/gates/shared.ts`. JSON parse failure is a gate failure.
+   */
+  expectJson: z.record(z.unknown()).optional(),
+  /**
+   * Response headers that must be present (case-insensitive). Each value
+   * is a substring match. Useful for `content-type: application/json`,
+   * CORS, or `www-authenticate` checks.
+   */
+  expectHeaders: z.record(z.string()).optional(),
+  timeoutSec: z.number().int().positive().default(15),
+});
+export type HttpGate = z.infer<typeof HttpGate>;
+
+const ConvexFnGate = z.object({
+  type: z.literal('convex-fn'),
+  name: z.string(),
+  /**
+   * Function reference in `module:export` (or `module.export`) form, e.g.
+   * `users:create` or `notes.list`. Resolved through the project's
+   * `convex/browser` ConvexHttpClient.
+   */
+  fn: z.string(),
+  kind: z.enum(['query', 'mutation', 'action']).default('query'),
+  args: z.record(z.unknown()).default({}),
+  /**
+   * Partial deep-match shape against the function's return value. Only
+   * supports primitives + nested objects + array `length`. If absent, any
+   * non-throwing return counts as pass.
+   */
+  expect: z
+    .object({
+      shape: z.record(z.unknown()).optional(),
+    })
+    .optional(),
+  /**
+   * Override the deployment URL. Defaults to `process.env.CONVEX_URL`
+   * (which `convex dev` writes to `.env.local`).
+   */
+  url: z.string().optional(),
+  timeoutSec: z.number().int().positive().default(30),
+});
+export type ConvexFnGate = z.infer<typeof ConvexFnGate>;
+
+/**
+ * Gate union. `type` is mandatory for new gates but legacy shell gates
+ * (no `type` field) parse as ShellGate via the literal default.
+ */
+export const Gate = z.preprocess(
+  (v) => {
+    if (typeof v === 'object' && v !== null && !('type' in v)) {
+      return { ...v, type: 'shell' };
+    }
+    return v;
+  },
+  z.discriminatedUnion('type', [ShellGate, HttpGate, ConvexFnGate])
+);
+export type Gate = z.infer<typeof Gate>;
+
 export const RunConfig = z.object({
   /** Max passes through the queue before escalating to user (default: 2). */
   maxPasses: z.number().int().positive().default(2),
@@ -57,19 +172,20 @@ export const RunConfig = z.object({
   subagentTimeoutSec: z.number().int().positive().default(1800),
   /** Whether to instruct the implementer subagent to invoke /review-loop. */
   useReviewLoop: z.boolean().default(true),
+  /**
+   * Background services started once at run begin and stopped at run end.
+   * Read-after-ready env files (e.g. .env.local) merge into process.env so
+   * downstream gates see the right CONVEX_URL etc.
+   */
+  services: z.array(ServiceDef).default([]),
   /** Verification gates run after each task. */
-  gates: z
-    .array(
-      z.object({
-        name: z.string(),
-        command: z.string(),
-        /** Optional working dir override (defaults to project root). */
-        cwd: z.string().optional(),
-        /** Skip gate if this command fails (e.g. detect missing tsconfig). */
-        skipIf: z.string().optional(),
-      })
-    )
-    .default([]),
+  gates: z.array(Gate).default([]),
+  /**
+   * Path (relative to project root) to an MCP config file passed to every
+   * implementer subagent via `claude --mcp-config`. Use this to wire in the
+   * Convex MCP so the subagent can introspect schema and call functions.
+   */
+  mcpConfigPath: z.string().optional(),
 });
 export type RunConfig = z.infer<typeof RunConfig>;
 

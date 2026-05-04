@@ -1,6 +1,7 @@
 import type { Task, GateResult, RunState } from './types.js';
 import { summarizeGates } from './runner/gates.js';
 import type { Prerequisite } from './parsers/speckit.js';
+import { sanitizeForTerminal } from './protected-env.js';
 
 const c = {
   reset: '\x1b[0m',
@@ -62,6 +63,23 @@ export function printSubagentStreamLine(line: string): void {
   process.stdout.write(color('dim', `    │ ${line.replace(/\s+$/, '')}\n`));
 }
 
+/**
+ * Output line from a managed background service. Tagged with the service
+ * name so concurrent services (convex + next dev + …) stay readable.
+ *
+ * Defense-in-depth: services.ts already strips C0/C1 from each piped line,
+ * but if a service emits the `[exit code=…]` style markers we generate
+ * ourselves (or a future caller wires this up directly), we still want to
+ * neutralize anything embedded inside.
+ */
+export function printServiceLine(serviceName: string, line: string): void {
+  const safe = sanitizeForTerminal(line).replace(/\s+$/, '');
+  if (!safe) return;
+  process.stdout.write(
+    color('dim', `  ⎯ ${color('magenta', serviceName)} ${color('dim', safe)}\n`)
+  );
+}
+
 export function printFinalReport(state: RunState): void {
   console.log('');
   console.log(color('bold', '=== Final Report ==='));
@@ -101,28 +119,56 @@ export function printFinalReport(state: RunState): void {
 
 /**
  * Surface env vars that `auto` mode seeded with placeholder values during
- * the run. These are the ones the user MUST replace before going live.
+ * the run. Re-checks `process.env` AT REPORT TIME so vars the user fixed
+ * mid-run (between `fullauto auto` startup and `runOrchestrator` exit) are
+ * shown as "now set — placeholder no longer in effect" instead of being
+ * misreported as still-fake. Without this re-check the report lies for
+ * any var the user fixed by exporting in their shell after kickoff.
  */
 function printPlaceholderEnvs(names: string[]): void {
   if (names.length === 0) return;
-  console.log('');
-  console.log(
-    color(
-      'yellow',
-      `  ⚠ Placeholder env vars used during this run (replace with real values before going live):`
-    )
-  );
+  const stillMissing: string[] = [];
+  const nowSet: string[] = [];
   for (const n of names) {
+    const v = process.env[n];
+    if (v && !v.startsWith('FULLAUTO_PLACEHOLDER_')) {
+      nowSet.push(n);
+    } else {
+      stillMissing.push(n);
+    }
+  }
+  console.log('');
+  if (stillMissing.length > 0) {
     console.log(
-      `    • ${color('cyan', n)}  ${color('dim', `(subagents saw: FULLAUTO_PLACEHOLDER_${n})`)}`
+      color(
+        'yellow',
+        `  ⚠ Placeholder env vars used during this run (replace with real values before going live):`
+      )
+    );
+    for (const n of stillMissing) {
+      console.log(
+        `    • ${color('cyan', n)}  ${color('dim', `(subagents saw: FULLAUTO_PLACEHOLDER_${n})`)}`
+      );
+    }
+    console.log(
+      color(
+        'dim',
+        `    Grep for \`FULLAUTO_PLACEHOLDER_\` in the project to find any code that fell back to the placeholder value.`
+      )
     );
   }
-  console.log(
-    color(
-      'dim',
-      `    Grep for \`FULLAUTO_PLACEHOLDER_\` in the project to find any code that fell back to the placeholder value.`
-    )
-  );
+  if (nowSet.length > 0) {
+    if (stillMissing.length > 0) console.log('');
+    console.log(
+      color(
+        'green',
+        `  ✓ Placeholder env vars that you have since set in your shell (subagents may have seen the placeholder for early tasks):`
+      )
+    );
+    for (const n of nowSet) {
+      console.log(`    • ${color('cyan', n)}`);
+    }
+  }
 }
 
 export function printNoProgressBail(): void {
@@ -146,18 +192,6 @@ export function printWarn(msg: string): void {
 
 export function printError(msg: string): void {
   console.log(color('red', `✗ ${msg}`));
-}
-
-/**
- * Strip C0/C1 control characters from prereq fields before they hit the
- * terminal. Without this, a malicious tasks.md (fully user-controlled in
- * `run` mode) can embed ANSI CSI / OSC sequences or carriage returns that
- * overwrite earlier "✓ set" status, hide unset markers, or set the terminal
- * title. Keep tab so legitimate whitespace survives.
- */
-function sanitizeForTerminal(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
 }
 
 /**

@@ -12,11 +12,14 @@ import {
   printTaskDone,
   printTaskDeferred,
   printSubagentStreamLine,
+  printServiceLine,
   printFinalReport,
   printNoProgressBail,
   printInfo,
   printWarn,
+  printError,
 } from './reporter.js';
+import { ServiceManager } from './services.js';
 
 export interface RunOptions {
   projectDir: string;
@@ -42,67 +45,94 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
   // Establish snapshot for the current pass if not already set (resume case).
   queue.snapshotPassStart();
 
-  while (!queue.isComplete()) {
-    if (state.currentPass > state.config.maxPasses) {
-      printWarn(
-        `Reached maxPasses (${state.config.maxPasses}) — stopping. Remaining tasks will be reported as deferred.`
-      );
-      break;
+  const services = new ServiceManager(projectDir, state.config.services);
+  if (!services.isEmpty) {
+    printInfo(
+      `Starting ${state.config.services.length} background service(s): ${state.config.services.map((s) => s.name).join(', ')}`
+    );
+    try {
+      await services.startAll((name, line) => printServiceLine(name, line));
+    } catch (err) {
+      printError(`Service startup failed: ${(err as Error).message}`);
+      await services.stopAll((name, line) => printServiceLine(name, line));
+      throw err;
     }
+  }
 
-    const { ready, blocked } = countEligibleInCurrentPass(queue, state);
-    printPassStart(state.currentPass, ready, blocked);
+  try {
+    while (!queue.isComplete()) {
+      if (state.currentPass > state.config.maxPasses) {
+        printWarn(
+          `Reached maxPasses (${state.config.maxPasses}) — stopping. Remaining tasks will be reported as deferred.`
+        );
+        break;
+      }
 
-    if (ready === 0) {
-      // Either nothing in current state matches the pass status filter, or
-      // every candidate is dependency-blocked. Either way, no work to do this
-      // pass — advance and let promotion / no-progress detection handle it.
+      const { ready, blocked } = countEligibleInCurrentPass(queue, state);
+      printPassStart(state.currentPass, ready, blocked);
+
+      if (ready === 0) {
+        // Either nothing in current state matches the pass status filter, or
+        // every candidate is dependency-blocked. Either way, no work to do this
+        // pass — advance and let promotion / no-progress detection handle it.
+        const advanced = await maybeAdvancePass(queue, state, projectDir);
+        if (!advanced) break;
+        continue;
+      }
+
+      // Inner loop: drain everything eligible in the current pass.
+      let task = queue.next();
+      while (task) {
+        // Bail before starting a new task if any background service died
+        // post-ready — otherwise every gate that depends on it would fail
+        // with connection errors and burn through maxPasses for no reason.
+        try {
+          services.assertAllAlive();
+        } catch (err) {
+          printError((err as Error).message);
+          throw err;
+        }
+        await processOneTask(task, projectDir, state, verbose ?? false);
+        await saveState(projectDir, state);
+        task = queue.next();
+      }
+
+      // End-of-pass progress check before moving on.
+      if (queue.noProgressInCurrentPass() && state.currentPass > 1) {
+        printNoProgressBail();
+        // Convert remaining deferred → still deferred (no status change), exit loop.
+        break;
+      }
+
       const advanced = await maybeAdvancePass(queue, state, projectDir);
       if (!advanced) break;
-      continue;
     }
 
-    // Inner loop: drain everything eligible in the current pass.
-    let task = queue.next();
-    while (task) {
-      await processOneTask(task, projectDir, state, verbose ?? false);
-      await saveState(projectDir, state);
-      task = queue.next();
+    // Loop terminated. Anything still `deferred` after maxPasses / no-progress
+    // bail is the orchestrator's terminal failure mode — promote to `failed` so
+    // `isComplete()` reaches true and the final report distinguishes "still
+    // retrying" from "we gave up". Any pending stragglers (shouldn't exist by
+    // here since maybeAdvancePass promotes them, but be defensive) get the same
+    // treatment.
+    for (const t of state.tasks) {
+      if (t.status === 'deferred' || t.status === 'pending') {
+        const last = t.attempts[t.attempts.length - 1];
+        const reasonHint = last?.deferDetail ?? 'never reached a terminal state';
+        t.status = 'failed';
+        const synthetic = attemptFresh(state.currentPass);
+        synthetic.deferReason = last?.deferReason ?? 'unknown';
+        synthetic.deferDetail = `Promoted to failed after orchestrator exit: ${reasonHint}`;
+        synthetic.finishedAt = new Date().toISOString();
+        t.attempts.push(synthetic);
+      }
     }
 
-    // End-of-pass progress check before moving on.
-    if (queue.noProgressInCurrentPass() && state.currentPass > 1) {
-      printNoProgressBail();
-      // Convert remaining deferred → still deferred (no status change), exit loop.
-      break;
-    }
-
-    const advanced = await maybeAdvancePass(queue, state, projectDir);
-    if (!advanced) break;
+    await saveState(projectDir, state);
+    printFinalReport(state);
+    return state;
+  } finally {
+    await services.stopAll((name, line) => printServiceLine(name, line));
   }
-
-  // Loop terminated. Anything still `deferred` after maxPasses / no-progress
-  // bail is the orchestrator's terminal failure mode — promote to `failed` so
-  // `isComplete()` reaches true and the final report distinguishes "still
-  // retrying" from "we gave up". Any pending stragglers (shouldn't exist by
-  // here since maybeAdvancePass promotes them, but be defensive) get the same
-  // treatment.
-  for (const t of state.tasks) {
-    if (t.status === 'deferred' || t.status === 'pending') {
-      const last = t.attempts[t.attempts.length - 1];
-      const reasonHint = last?.deferDetail ?? 'never reached a terminal state';
-      t.status = 'failed';
-      const synthetic = attemptFresh(state.currentPass);
-      synthetic.deferReason = last?.deferReason ?? 'unknown';
-      synthetic.deferDetail = `Promoted to failed after orchestrator exit: ${reasonHint}`;
-      synthetic.finishedAt = new Date().toISOString();
-      t.attempts.push(synthetic);
-    }
-  }
-
-  await saveState(projectDir, state);
-  printFinalReport(state);
-  return state;
 }
 
 function countEligibleInCurrentPass(queue: TaskQueue, state: RunState): {

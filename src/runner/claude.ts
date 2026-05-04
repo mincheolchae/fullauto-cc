@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { mkdir, access, realpath } from 'node:fs/promises';
+import { dirname, resolve as resolvePath, sep as pathSep } from 'node:path';
 import type { Task, RunConfig } from '../types.js';
+import { isProtectedEnvName } from '../protected-env.js';
 
 export interface SubagentResult {
   exitCode: number;
@@ -117,6 +118,17 @@ const DEFER_LINE = /^FULLAUTO_RESULT:\s*DEFER(?:\s+(.+?))?\s*$/gm;
 // markdown via embedded `=` / newline.
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/**
+ * Check that `child` is under `parent` (or equals it). Uses platform-native
+ * separator so the same check works on POSIX and Windows. Both inputs
+ * should already be absolute paths normalized via `resolve`/`realpath`.
+ */
+function isInside(child: string, parent: string): boolean {
+  if (child === parent) return false; // disallow the project root itself
+  const normalized = parent.endsWith(pathSep) ? parent : parent + pathSep;
+  return child.startsWith(normalized);
+}
+
 export interface SubagentVerdict {
   /**
    * `defer` is an advisory early-stop hint from the subagent; everything else
@@ -157,6 +169,11 @@ export async function runSubagent(
   if (placeholderEnvs?.length) {
     for (const name of placeholderEnvs) {
       if (!ENV_NAME.test(name)) continue;
+      // Defense-in-depth: even though the planner is asked for app-level
+      // env vars, never overlay program-loader / TLS / npm / git / SSH
+      // names — a `FULLAUTO_PLACEHOLDER_PATH` value would just break the
+      // subagent's spawn, but the policy belongs in one place.
+      if (isProtectedEnvName(name)) continue;
       if (process.env[name] === undefined || process.env[name] === '') {
         placeholderOverlay[name] = `FULLAUTO_PLACEHOLDER_${name}`;
         actuallyPlaceheld.push(name);
@@ -174,6 +191,38 @@ export async function runSubagent(
 
   const startedAt = Date.now();
 
+  // Resolve --mcp-config path BEFORE entering the promise. Skip silently
+  // when the file is missing OR escapes the project root. The user controls
+  // config.json so this isn't privilege escalation, but a `../../../etc/passwd`
+  // (or a symlink-from-inside pointing outside) would leak absolute filesystem
+  // layout to whatever sink `claude` logs to.
+  //
+  // Containment is checked twice with the right pair on each side:
+  //   1. LEXICAL: `..` segments after `resolve` must stay within the lexical
+  //      project root. (Both sides lexical so macOS /var → /private/var
+  //      symlink-traversal doesn't false-reject.)
+  //   2. REAL:    after `realpath`, the file's actual on-disk location
+  //      must stay within the project's real root, defeating any symlink
+  //      whose target leaves the tree.
+  const mcpArgs: string[] = [];
+  if (config.mcpConfigPath) {
+    const lexicalProject = resolvePath(projectDir);
+    const realProject = await realpath(projectDir).catch(() => lexicalProject);
+    const lexicalAbs = resolvePath(projectDir, config.mcpConfigPath);
+    if (isInside(lexicalAbs, lexicalProject)) {
+      try {
+        await access(lexicalAbs);
+        const realAbs = await realpath(lexicalAbs).catch(() => lexicalAbs);
+        if (isInside(realAbs, realProject)) {
+          mcpArgs.push('--mcp-config', realAbs);
+        }
+        // else: symlink escape — silent skip, same as missing file.
+      } catch {
+        // Missing file is non-fatal: many projects haven't opted in.
+      }
+    }
+  }
+
   return new Promise<SubagentResult>((resolve) => {
     // -p / --print: headless mode (one prompt in, response out, then exits).
     // We pass the prompt as the positional argument so it's not mangled by stdin handling.
@@ -182,6 +231,7 @@ export async function runSubagent(
       prompt,
       '--permission-mode',
       'acceptEdits',
+      ...mcpArgs,
     ];
     const child = spawn('claude', args, {
       cwd: projectDir,

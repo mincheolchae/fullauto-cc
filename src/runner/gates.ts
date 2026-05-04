@@ -1,11 +1,15 @@
 import { spawn } from 'node:child_process';
-import type { GateResult, RunConfig } from '../types.js';
+import type { Gate, GateResult, RunConfig, ShellGate } from '../types.js';
+import { runHttpGate } from './gates/http.js';
+import { runConvexFnGate } from './gates/convex-fn.js';
 
 interface RunCommandResult {
   exitCode: number;
   output: string;
   durationMs: number;
 }
+
+const DEFAULT_SHELL_TIMEOUT_SEC = 600; // 10min cap per gate
 
 function runCommand(
   command: string,
@@ -51,43 +55,60 @@ function runCommand(
   });
 }
 
-const GATE_TIMEOUT_SEC = 600; // 10min cap per gate
+async function runShellGate(
+  gate: ShellGate,
+  projectDir: string
+): Promise<GateResult> {
+  const cwd = gate.cwd ?? projectDir;
+  const timeoutSec = gate.timeoutSec ?? DEFAULT_SHELL_TIMEOUT_SEC;
+
+  if (gate.skipIf) {
+    const probe = await runCommand(gate.skipIf, cwd, 30);
+    if (probe.exitCode === 0) {
+      return {
+        name: gate.name,
+        passed: true,
+        command: gate.command,
+        exitCode: 0,
+        output: `[skipped: skipIf check exited 0 — ${gate.skipIf}]`,
+        durationMs: probe.durationMs,
+      };
+    }
+  }
+
+  const r = await runCommand(gate.command, cwd, timeoutSec);
+  return {
+    name: gate.name,
+    passed: r.exitCode === 0,
+    command: gate.command,
+    exitCode: r.exitCode,
+    output: r.output.slice(-8000), // cap log size
+    durationMs: r.durationMs,
+  };
+}
+
+async function runOneGate(
+  gate: Gate,
+  projectDir: string
+): Promise<GateResult> {
+  switch (gate.type) {
+    case 'shell':
+      return runShellGate(gate, projectDir);
+    case 'http':
+      return runHttpGate(gate);
+    case 'convex-fn':
+      return runConvexFnGate(gate, projectDir);
+  }
+}
 
 export async function runGates(
   config: RunConfig,
   projectDir: string
 ): Promise<GateResult[]> {
   const results: GateResult[] = [];
-
   for (const gate of config.gates) {
-    const cwd = gate.cwd ?? projectDir;
-
-    if (gate.skipIf) {
-      const probe = await runCommand(gate.skipIf, cwd, 30);
-      if (probe.exitCode === 0) {
-        results.push({
-          name: gate.name,
-          passed: true,
-          command: gate.command,
-          exitCode: 0,
-          output: `[skipped: skipIf check exited 0 — ${gate.skipIf}]`,
-          durationMs: probe.durationMs,
-        });
-        continue;
-      }
-    }
-
-    const r = await runCommand(gate.command, cwd, GATE_TIMEOUT_SEC);
-    results.push({
-      name: gate.name,
-      passed: r.exitCode === 0,
-      command: gate.command,
-      exitCode: r.exitCode,
-      output: r.output.slice(-8000), // cap log size
-      durationMs: r.durationMs,
-    });
+    results.push(await runOneGate(gate, projectDir));
   }
-
   return results;
 }
 
