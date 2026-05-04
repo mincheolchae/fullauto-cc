@@ -1,0 +1,194 @@
+import { spawn } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import type { Task, RunConfig } from '../types.js';
+
+export interface SubagentResult {
+  exitCode: number;
+  logPath: string;
+  timedOut: boolean;
+  durationMs: number;
+  /**
+   * Captured stdout from the subagent only — does NOT include the prompt that
+   * was written to the log file or stderr noise. The orchestrator must use
+   * this (not the log file) to parse the FULLAUTO_RESULT verdict, otherwise
+   * a malicious tasks.md whose title/body contains a literal
+   * `FULLAUTO_RESULT: DONE` line would forge a successful verdict via the
+   * prompt section of the log.
+   */
+  stdout: string;
+}
+
+export interface SpawnOptions {
+  task: Task;
+  config: RunConfig;
+  /** Project working directory the subagent operates in. */
+  projectDir: string;
+  /** Where to write the subagent transcript log. */
+  logPath: string;
+  /** Optional callback for each chunk of stdout/stderr. */
+  onOutput?: (chunk: string) => void;
+}
+
+/**
+ * Build the prompt sent to the implementer subagent.
+ *
+ * Constraints we enforce by prompt:
+ *  - Work on ONE task only (no scope creep into other tasks).
+ *  - Must invoke /review-loop before declaring done (when enabled).
+ *  - On unrecoverable obstacle, output a structured DEFER marker so the
+ *    orchestrator can mark the task `deferred` instead of `failed`.
+ */
+export function buildSubagentPrompt(task: Task, config: RunConfig): string {
+  const reviewLoopInstruction = config.useReviewLoop
+    ? `When the implementation compiles and the smoke path works, invoke the /review-loop skill to spawn fresh-context reviewer subagents. Address every BLOCK-level finding before finishing. WARN/INFO findings should be reported in your final message but not auto-fixed.`
+    : `When the implementation compiles and the smoke path works, perform a self-review pass: re-read each changed file with fresh eyes and fix any obvious bugs, then proceed.`;
+
+  return [
+    `# Single-Task Implementation Job`,
+    ``,
+    `You are running inside a full-auto orchestrator. Your job is to implement EXACTLY ONE task and stop. Do not start other tasks. Do not read or modify files unrelated to this task.`,
+    ``,
+    `## Task ID: ${task.id}`,
+    ``,
+    `### Title`,
+    task.title,
+    ``,
+    `### Details`,
+    task.body,
+    ``,
+    `## Rules`,
+    `1. Implement only what this task describes. If you discover a missing prerequisite that belongs to another task, STOP and emit the DEFER marker described below — do not invent a workaround.`,
+    `2. ${reviewLoopInstruction}`,
+    `3. Do not run \`git commit\`, \`git push\`, or any destructive shell command unless the task explicitly requires it.`,
+    `4. Verification gates (typecheck/test/lint) are run by the orchestrator AFTER you finish — you do not need to invoke them yourself, but your code must pass them.`,
+    ``,
+    `## Output protocol`,
+    `If you cannot complete this task — missing prerequisite, environmental issue, unresolved BLOCK from /review-loop — end your final message with this line on its own:`,
+    ``,
+    `   FULLAUTO_RESULT: DEFER <one-line reason>`,
+    ``,
+    `Otherwise, just finish normally. The orchestrator will run verification gates (typecheck/test/lint) to confirm your work; the gate results are authoritative. You do not need to emit a DONE marker — gates decide.`,
+  ].join('\n');
+}
+
+// Match the LAST occurrence of a DEFER marker in the stream — a subagent that
+// hedges mid-thought ("I might emit FULLAUTO_RESULT: DEFER X") then commits to
+// a different verdict at the end shouldn't be tripped by the earlier mention.
+// Accept an optional reason; bare `FULLAUTO_RESULT: DEFER` is a valid early-stop.
+const DEFER_LINE = /^FULLAUTO_RESULT:\s*DEFER(?:\s+(.+?))?\s*$/gm;
+
+export interface SubagentVerdict {
+  /**
+   * `defer` is an advisory early-stop hint from the subagent; everything else
+   * (including no marker at all) falls through to gate verification in the
+   * orchestrator. We deliberately do NOT trust a `FULLAUTO_RESULT: DONE`
+   * marker as authoritative — it can be forged via prompt injection from a
+   * malicious tasks.md that interpolates into the subagent prompt.
+   */
+  kind: 'defer' | 'no_defer';
+  deferReason?: string;
+}
+
+export function parseSubagentVerdict(transcript: string): SubagentVerdict {
+  let lastMatch: RegExpExecArray | null = null;
+  let m: RegExpExecArray | null;
+  // Scan for all DEFER markers; the last one wins.
+  while ((m = DEFER_LINE.exec(transcript)) !== null) lastMatch = m;
+  if (!lastMatch) return { kind: 'no_defer' };
+  return {
+    kind: 'defer',
+    deferReason: lastMatch[1]?.trim() || 'subagent requested defer (no reason given)',
+  };
+}
+
+export async function runSubagent(
+  opts: SpawnOptions
+): Promise<SubagentResult> {
+  const { task, config, projectDir, logPath, onOutput } = opts;
+  const prompt = buildSubagentPrompt(task, config);
+
+  await mkdir(dirname(logPath), { recursive: true });
+  const logStream = createWriteStream(logPath, { flags: 'w' });
+  logStream.write(`# Subagent transcript for ${task.id}\n`);
+  logStream.write(`# Started: ${new Date().toISOString()}\n`);
+  logStream.write(`# Prompt:\n${prompt}\n\n# === STDOUT ===\n`);
+
+  const startedAt = Date.now();
+
+  return new Promise<SubagentResult>((resolve) => {
+    // -p / --print: headless mode (one prompt in, response out, then exits).
+    // We pass the prompt as the positional argument so it's not mangled by stdin handling.
+    const args = [
+      '-p',
+      prompt,
+      '--permission-mode',
+      'acceptEdits',
+    ];
+    const child = spawn('claude', args, {
+      cwd: projectDir,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let timedOut = false;
+    let settled = false;
+    const stdoutChunks: string[] = [];
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      // Hard-kill if it doesn't shut down quickly
+      setTimeout(() => child.kill('SIGKILL'), 5000);
+    }, config.subagentTimeoutSec * 1000);
+
+    const finalize = (exitCode: number, errorTail?: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      const durationMs = Date.now() - startedAt;
+      if (errorTail) {
+        logStream.write(`\n# === ERROR ===\n${errorTail}\n`);
+      } else {
+        logStream.write(
+          `\n# === EXIT ${exitCode} (${timedOut ? 'TIMEOUT' : 'normal'}, ${durationMs}ms) ===\n`
+        );
+      }
+      // logStream.end(callback) waits for the OS-level flush to complete
+      // before invoking the callback. Without this, readers can race the
+      // tail-of-file write — but since we now return stdout in-memory, the
+      // log file is only used for human inspection, so the wait is for
+      // post-mortem completeness rather than verdict parsing.
+      logStream.end(() => {
+        resolve({
+          exitCode,
+          logPath,
+          timedOut,
+          durationMs,
+          stdout: stdoutChunks.join(''),
+        });
+      });
+    };
+
+    child.stdout.on('data', (data: Buffer) => {
+      const text = data.toString('utf-8');
+      stdoutChunks.push(text);
+      logStream.write(text);
+      onOutput?.(text);
+    });
+    child.stderr.on('data', (data: Buffer) => {
+      const text = data.toString('utf-8');
+      logStream.write(text);
+      onOutput?.(text);
+    });
+
+    child.on('error', (err) => {
+      finalize(-1, err.stack ?? err.message);
+    });
+
+    child.on('close', (code) => {
+      finalize(code ?? -1);
+    });
+  });
+}

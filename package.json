@@ -1,0 +1,46 @@
+{
+  "name": "fullauto-cc",
+  "version": "0.1.0",
+  "description": "Full-auto orchestrator for Claude Code: sequential task execution with verification gates and self-correcting review loop",
+  "type": "module",
+  "license": "MIT",
+  "author": "Mincheol Chae <cmc752@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mincheolchae/fullauto-cc.git"
+  },
+  "homepage": "https://github.com/mincheolchae/fullauto-cc#readme",
+  "bugs": {
+    "url": "https://github.com/mincheolchae/fullauto-cc/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "agent",
+    "orchestrator",
+    "speckit",
+    "automation",
+    "ai"
+  ],
+  "bin": {
+    "fullauto": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
