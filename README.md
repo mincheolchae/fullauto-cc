@@ -111,12 +111,17 @@ LLM 리뷰만 하는 단순 review-loop보다 강한 이유는 세 가지:
 
 작업 전 또는 후에 fresh researcher subagent를 spawn해서 **WebSearch로 최근
 12~18개월 업계 트렌드를 조회**하고 프로젝트의 vibe(스택, 컨벤션, 최근
-방향)와 비교합니다. 작은 ENHANCE / FIT-BREAK는 자동 적용하고, 큰 건은
-OPTIONAL로 보고만. 적용한 추가는 `/verify-loop`로 재검증 — 사용자가 안 본
-proactive 변경에 안전망을 거는 형태.
+방향)와 비교합니다. **자동 적용의 기준은 "fit confidence"** — 프로젝트에
+이미 같은 패턴이 있고 (file:line 인용 의무), 새 외부 의존성이 없고,
+아키텍처 피벗이 아닌 변경이라면 **크기 무관하게 자동 적용**합니다.
+새 의존성·아키텍처 변화·의견 갈리는 선택은 OPTIONAL로 사용자에게 보고만.
+적용한 추가는 `/verify-loop`로 재검증 — 사용자가 안 본 proactive 변경에
+안전망을 거는 형태.
 
 핵심 룰:
 - **No-op도 valid 결과** — 추가할 거 없으면 그냥 통과 ("invent work" 금지)
+- **`[ENHANCE:S]` (작은 추가)**와 **`[ENHANCE:L]` (큰 추가)** 둘 다 자동 적용. `[ENHANCE:L]`은 fit citation(기존 패턴 file:line) 의무, 없으면 OPTIONAL로 강등
+- LARGE 자동 적용분은 **최종 보고에서 별도 🆙 섹션**으로 prominent하게 표시 — 무엇/어디/왜 fit인지/트레이드오프/한 줄 revert 명령까지
 - 적용 후 항상 `/verify-loop`로 검증, BLOCK 못 풀면 그 추가만 revert
 - 프로젝트의 명시적 컨벤션이 generic best practice를 이긴다 (README/CLAUDE.md 우선)
 
@@ -403,7 +408,9 @@ fullauto run .fullauto/auto-tasks.md
 `run` 또는 `auto`에 `--vibe-enhance`를 붙이면, 한 기능이 끝날 때마다
 `/vibe-enhance` 스킬이 돌아갑니다. fresh researcher 서브에이전트가
 WebSearch로 최신 트렌드를 조회하고 프로젝트 분위기에 맞는 개선/추가 거리를
-찾아서 작은 ENHANCE만 자동 적용한 다음 `/verify-loop`로 검증합니다.
+찾아서 fit이 명확한 ENHANCE는 크기 무관하게 자동 적용한 다음
+`/verify-loop`로 검증합니다 (LARGE 적용분은 최종 보고의 🆙 섹션으로 별도
+표시 — 인용한 기존 패턴, 트레이드오프, 한 줄 revert 명령 포함).
 
 ```bash
 # 모드 A — 기능(=user story) 단위

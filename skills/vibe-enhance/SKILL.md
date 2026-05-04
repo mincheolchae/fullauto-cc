@@ -65,14 +65,23 @@ The researcher returns a categorized suggestion list with web sources cited.
 
 The researcher tags every suggestion with one of four categories. Researchers fed WebSearch tend to bias toward novelty — you have the final say on category and on whether to act.
 
+**The bar is *fit confidence and dependency/architecture neutrality*, not size.** A 200-line addition can be ENHANCE if it merely extends a pattern the project already uses. A 5-line addition can be OPTIONAL if it pulls in a new dependency or makes an architectural choice.
+
 | Category | Definition | Default action |
 |---|---|---|
 | **FIT-BREAK** | The current change clashes with the project's established conventions or stack — e.g., introducing a second state library, breaking the design token system, mixing async patterns inconsistently | Apply unless the user explicitly chose the divergence |
-| **ENHANCE** | A concrete, scoped addition that clearly improves the product — a11y pass, missing loading state, observability hook, sensible default, modern pattern the rest of the project already uses elsewhere. Bounded scope (≤ ~50 lines, ≤ 2 files, no new dependency). | Apply directly. No pre-apply confirmation. |
-| **OPTIONAL** | Real value but exceeds the ENHANCE scope ceiling — bigger refactor, new dependency, new infra, design overhaul, or a change the project may have intentionally opted out of | Report only. Never auto-apply. |
+| **ENHANCE** (small / `[ENHANCE:S]`) | A scoped addition (a few lines, single file, obvious extension) that clearly fits the project | Apply directly |
+| **ENHANCE** (large / `[ENHANCE:L]`) | A larger addition (multi-file, beyond ~50 lines) that **clearly fits** — the pattern already lives in the project (you can cite the existing file:line), no new external dependency, no architectural pivot, revertible as one logical unit | Apply directly. **Each large application MUST cite the internal pre-existing pattern that justifies the fit.** Without that citation, downgrade to OPTIONAL. |
+| **OPTIONAL** | Genuine value but the change is the kind users typically want to consciously decide: introduces a NEW external dependency, requires an architectural pivot, is an opinionated tech choice (auth provider, db swap, framework adoption), reasonable people would disagree on the direction, or the project may have intentionally opted out of it | Report only. Never auto-apply. |
 | **TREND-NOTE** | Industry trend worth knowing but not actionable here — context only | Mention briefly in final report |
 
-Filter aggressively. The bar is **"clearly fits THIS project as it exists today."** When borderline between ENHANCE and OPTIONAL, lean OPTIONAL — the user is the tiebreaker for scope expansion.
+Filter aggressively. **When borderline between ENHANCE:L and OPTIONAL, lean OPTIONAL** — the test is "could a reasonable engineer on this team disagree with this direction?" If yes, it's a decision, not an enhancement. The user is the tiebreaker for decisions.
+
+What disqualifies a finding from ENHANCE (any size):
+- Adds a row to `package.json` / `pyproject.toml` / `Cargo.toml` `[dependencies]`
+- Introduces a new top-level concept (new auth lib, new state lib, new build tool)
+- Changes the deployment / runtime / data model in a way that ripples beyond the touched code
+- Has a "we should adopt X" framing rather than "let's extend our existing X"
 
 ## Phase E — Apply (or do nothing)
 
@@ -80,13 +89,17 @@ Filter aggressively. The bar is **"clearly fits THIS project as it exists today.
 
 If after triage there are **no FIT-BREAKs and no ENHANCEs to apply**: skip directly to Phase G with the no-op report. Do not invent work to justify the skill invocation. Do not downgrade an OPTIONAL item to ENHANCE just to have something to ship.
 
-Otherwise, for each FIT-BREAK and ENHANCE you decide to apply:
+Otherwise, for each FIT-BREAK and ENHANCE (small or large) you decide to apply:
 
 1. Apply with `Edit` / `Write`. No mid-flight confirmation prompts — the user invoked this skill knowing it adds work. Trust the triage and proceed.
 2. Keep each addition independently revertible — discrete, scoped edits, never mixed with unrelated changes. The user must be able to revert any single addition cleanly from the report alone.
-3. Do not bundle OPTIONAL items into this step. Those go to the final report only — OPTIONAL is the bucket for changes too large or opinionated for the implicit approval this skill carries.
+3. **For every `[ENHANCE:L]` (large) application, capture extra notes** before moving on, to be surfaced in the Phase G report under a dedicated "LARGE additions" subsection:
+   - **Fit citation** — the existing file:line in the project that establishes this pattern as already-used. Mandatory. If you can't find one, you misjudged the category — downgrade to OPTIONAL and don't apply.
+   - **Trade-off statement** — what cost this addition brings (build time, runtime overhead, maintenance, bundle size, etc.). Even great additions have costs.
+   - **Single-line revert** — exact `git revert <hash>` style command, OR file-level "remove `<file>`, restore `<file>` from HEAD~1" instruction.
+4. Do not bundle OPTIONAL items into this step. Those go to the final report only — OPTIONAL is the bucket for changes that introduce new dependencies, pivot architecture, or are opinionated enough that the user should consciously decide.
 
-The accountability for unrequested work happens in Phase G (thorough report) and Phase F (verify-loop), not in a pre-apply prompt.
+The accountability for unrequested work — especially for large additions — happens in Phase G (thorough report) and Phase F (verify-loop), not in a pre-apply prompt.
 
 ## Phase F — Verify additions via /verify-loop
 
@@ -112,20 +125,38 @@ Pick the matching template.
 
 **Template 1 — additions were applied:**
 
+LARGE 추가 (`[ENHANCE:L]` 또는 다중 파일 FIT-BREAK)는 사용자 시야를 더
+크게 차지하니 **별도 섹션으로 prominent하게** 보고. 작은 추가는 한 묶음.
+
 ```
 ## vibe-enhance 완료
 
 🎯 프로젝트 분위기: <한 줄 요약 — 스택, 컨벤션, 최근 방향>
 
-✅ 적용한 추가 작업 (n개):
+✅ 자동 적용한 작은 추가 (n개 — 작은 ENHANCE / FIT-BREAK):
 
 1. <제목>
    - 무엇을: <한 줄>
    - 어디에: <file:line 또는 file 범위>
    - 왜: <근거 한 줄 — 무엇이 좋아지는지>
    - 출처: <web URL 또는 "internal: <file:line>에서 이미 같은 패턴 사용">
-   - 카테고리: FIT-BREAK | ENHANCE
-   - 되돌리려면: <한 줄 — "<file>의 <함수/블록> 제거" 정도>
+   - 카테고리: FIT-BREAK | ENHANCE:S
+   - 되돌리려면: <한 줄>
+
+2. ...
+
+🆙 자동 적용한 LARGE 추가 (n개 — `[ENHANCE:L]`, 명확한 fit으로 판단됨):
+
+> 이 섹션의 변경은 작은 ENHANCE보다 영향이 크므로, 기대와 다르면 아래
+> "되돌리려면"을 참고해 빠르게 revert하세요. 큰 변경 0개면 이 섹션 생략.
+
+1. <제목>
+   - 무엇을: <2~3줄로 충분히 묘사 — 어떤 기능이 추가됐는지>
+   - 어디에: <touched files 전체 리스트, 줄 범위 포함>
+   - 왜 fit으로 판단했나: <기존 코드와의 부합 근거 — 어떤 패턴/컨벤션을 따르는지, 인용한 file:line>
+   - 트레이드오프: <이 추가가 가져오는 비용 — 빌드 시간, 번들 크기, 런타임 오버헤드, 유지보수 부담 등>
+   - 출처: <URL — 트렌드 근거가 된 원문>
+   - 되돌리려면: <명확한 한 줄 — git revert hash 또는 "rm <file>; git checkout HEAD -- <file>" 형식>
 
 2. ...
 
@@ -133,7 +164,7 @@ Pick the matching template.
 
 1. <제목>
    - 무엇을: <한 줄>
-   - 왜 OPTIONAL: <스코프가 큼 / 의도적 opt-out 가능성 / 의견이 갈릴 변경>
+   - 왜 OPTIONAL: <새 의존성 / 아키텍처 변화 / 의견이 갈리는 선택>
    - 출처: <URL>
 
 🔭 트렌드 노트 (참고만, n개):
@@ -142,7 +173,7 @@ Pick the matching template.
 🛡️ verify-loop 결과: <BLOCK n / WARN n / INFO n>
 - <BLOCK이 있었다면 어떻게 처리했는지 — 수정 / 해당 추가만 revert>
 
-다음 행동: <권장 조치 1줄, 또는 "그대로 마무리해도 됩니다. 마음에 들지 않으면 위 '되돌리려면' 줄 참고하세요.">
+다음 행동: <권장 조치 1줄, 또는 "그대로 마무리해도 됩니다. 마음에 들지 않으면 위 '되돌리려면' 줄 참고하세요. LARGE 추가가 있다면 그쪽을 먼저 검토하세요.">
 ```
 
 **Template 2 — no additions (no-op run):**
@@ -196,21 +227,25 @@ For every suggestion, output exactly:
   [CATEGORY] <one-line description>
   └ where: <file or area>
   └ why: <one sentence — what improves, with evidence>
+  └ fit citation: <REQUIRED for ENHANCE:L — internal file:line where the project already uses this pattern>
   └ source: <URL if web-derived, or "internal: project already does X elsewhere at file:line">
+  └ trade-off: <REQUIRED for ENHANCE:L — what cost the addition brings (build time, bundle, runtime, maintenance)>
 
 Categories (be honest, lean conservative):
 - FIT-BREAK: the current change clashes with established project conventions or stack.
-- ENHANCE: a concrete, scoped addition (≤ ~50 lines, ≤ 2 files) that clearly improves the product and fits the vibe.
-- OPTIONAL: real value but larger scope; flag for user judgment.
+- ENHANCE:S: small scoped addition (a few lines, single file, obvious extension) that clearly fits.
+- ENHANCE:L: larger addition (multi-file, beyond ~50 lines) that ALSO clearly fits — meaning the pattern already lives in the project (cite the internal file:line as `fit citation`), no new external dependency, no architectural pivot, can be reverted as one logical unit. Without a valid fit citation, downgrade to OPTIONAL.
+- OPTIONAL: genuine value but introduces a new external dependency, requires architectural pivot, is an opinionated tech choice (auth provider, db swap, framework adoption, etc.), reasonable engineers would disagree on direction, or the project may have intentionally opted out.
 - TREND-NOTE: trend worth knowing, not actionable here.
 
-Then a one-line summary: "Found N FIT-BREAK / N ENHANCE / N OPTIONAL / N TREND-NOTE."
+Then a one-line summary: "Found N FIT-BREAK / N ENHANCE:S / N ENHANCE:L / N OPTIONAL / N TREND-NOTE."
 If you found nothing actionable, say exactly: "No actionable suggestions — current direction fits the project well."
 
 ## Rules
 - DO NOT modify any files. Read-only.
 - DO NOT recommend changes that contradict an explicit project convention visible in README / CLAUDE.md / package manifests. The project's stated direction wins over generic best practices.
-- DO NOT recommend a different framework, language, or major library swap.
+- DO NOT recommend a different framework, language, or major library swap. Those are OPTIONAL at most, never ENHANCE.
+- DO NOT mark something as ENHANCE:L without a valid `fit citation` pointing to an existing project pattern. Without that anchor, you're recommending "we should adopt X," which is OPTIONAL by definition.
 - DO NOT pad the report. If there are no FIT-BREAKs or ENHANCEs, do not invent them. Researchers who manufacture suggestions make this skill worse.
 - Cite specific file:line for FIT-BREAK; cite specific area for ENHANCE.
 - For every web-derived claim, include the source URL. Unsourced "best practice" claims are not allowed.
@@ -222,7 +257,8 @@ If you found nothing actionable, say exactly: "No actionable suggestions — cur
 - **Researcher is a fresh agent.** Each invocation is a new `Agent` call. Never resume across runs of this skill — accumulated context biases the vibe model.
 - **Researcher does not write or edit.** Read-only + web-only. The implementer (you) holds the only pen.
 - **Filter aggressively at Phase D.** WebSearch-equipped agents over-suggest novelty. The bar is "clearly fits THIS project as it exists today," not "matches the latest hype."
-- **Auto-apply only small, low-risk ENHANCEs and clear FIT-BREAKs.** Anything larger surfaces to the user as OPTIONAL.
+- **The auto-apply bar is *fit confidence*, not size.** A multi-file ENHANCE:L is auto-applied when (a) the pattern already lives in the project (cite the file:line), (b) no new external dependency, (c) no architectural pivot, (d) revertible as one logical unit. Anything that introduces a new dependency, pivots architecture, or makes an opinionated tech choice is OPTIONAL even if small — those are decisions, not enhancements.
+- **Every LARGE auto-apply must be reported in the dedicated 🆙 section** of Template 1, with fit citation, trade-off, and a clean revert command. Buried-in-the-small-list reporting for a 200-line addition is a failure of this skill.
 - **Always chain into `/verify-loop` after Phase E.** Proactive additions the user hasn't seen need extra scrutiny — that's the safety net for autonomous scope expansion.
 - **If `/verify-loop` BLOCKs a proactive addition you can't cleanly fix in one cycle, revert that addition.** Do not ship half-fixed scope expansion.
 - **Skip the skill** for changes too small or too exploratory to warrant trend research. Tell the user "이 정도 변경에는 vibe-enhance 비용이 과합니다 — 그냥 진행하겠습니다" and proceed normally.
