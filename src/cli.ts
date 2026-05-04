@@ -2,7 +2,11 @@
 import { Command } from 'commander';
 import { resolve } from 'node:path';
 import { access } from 'node:fs/promises';
-import { loadTasksFromFile } from './parsers/speckit.js';
+import { createInterface } from 'node:readline';
+import {
+  loadPrerequisitesFromFile,
+  loadTasksFromFile,
+} from './parsers/speckit.js';
 import {
   ensureFullautoDir,
   loadState,
@@ -18,6 +22,7 @@ import {
   printError,
   printFinalReport,
   printInfo,
+  printPrerequisites,
   printResume,
   printWarn,
 } from './reporter.js';
@@ -122,10 +127,22 @@ program
     'Overwrite existing state.json (otherwise refuses if a run is in progress)',
     false
   )
+  .option('-y, --yes', 'Skip the manual-prerequisites confirmation prompt', false)
+  .option(
+    '--strict-prereqs',
+    'In non-interactive mode, abort if any [ENV] prerequisite is unset',
+    false
+  )
   .action(
     async (
       tasksFile: string,
-      opts: { dir: string; verbose: boolean; force: boolean }
+      opts: {
+        dir: string;
+        verbose: boolean;
+        force: boolean;
+        yes: boolean;
+        strictPrereqs: boolean;
+      }
     ) => {
       const projectDir = resolve(opts.dir);
       await ensureFullautoDir(projectDir);
@@ -150,6 +167,8 @@ program
         projectDir,
         tasksPath: resolve(tasksFile),
         verbose: opts.verbose,
+        yes: opts.yes,
+        strictPrereqs: opts.strictPrereqs,
       });
     }
   );
@@ -194,6 +213,8 @@ async function startFreshRun(args: {
   projectDir: string;
   tasksPath: string;
   verbose: boolean;
+  yes?: boolean;
+  strictPrereqs?: boolean;
 }): Promise<boolean> {
   const { projectDir, tasksPath, verbose } = args;
   const tasks = await loadTasksFromFile(tasksPath);
@@ -211,6 +232,18 @@ async function startFreshRun(args: {
     return false;
   }
 
+  printInfo(
+    `Loaded ${tasks.length} task(s) from ${tasksPath}. Project: ${projectDir}`
+  );
+
+  // Surface manual prerequisites BEFORE writing state.json — if the user
+  // aborts, we leave no on-disk traces of a half-started run.
+  const proceed = await surfacePrerequisites(tasksPath, {
+    skipConfirm: args.yes ?? false,
+    strict: args.strictPrereqs ?? false,
+  });
+  if (!proceed) return false;
+
   const state: RunState = {
     startedAt: new Date().toISOString(),
     currentPass: 1,
@@ -220,9 +253,6 @@ async function startFreshRun(args: {
   };
   await saveState(projectDir, state);
 
-  printInfo(
-    `Loaded ${tasks.length} task(s) from ${tasksPath}. Project: ${projectDir}`
-  );
   await runOrchestrator({ projectDir, state, verbose });
   return true;
 }
@@ -262,12 +292,16 @@ program
         process.exitCode = 2;
         return;
       }
-      await runPlanFlow({
+      const tasksPath = await runPlanFlow({
         projectDir,
         description,
         outputPath,
         timeoutSec: opts.timeout,
       });
+      if (tasksPath) {
+        const prereqs = await loadPrerequisitesFromFile(tasksPath);
+        printPrerequisites(prereqs);
+      }
     }
   );
 
@@ -356,6 +390,12 @@ program
     (v) => parseInt(v, 10),
     900
   )
+  .option('-y, --yes', 'Skip the manual-prerequisites confirmation prompt', false)
+  .option(
+    '--strict-prereqs',
+    'In non-interactive mode, abort if any [ENV] prerequisite is unset',
+    false
+  )
   .action(
     async (
       descriptionParts: string[],
@@ -365,6 +405,8 @@ program
         force: boolean;
         output: string;
         planTimeout: number;
+        yes: boolean;
+        strictPrereqs: boolean;
       }
     ) => {
       const projectDir = resolve(opts.dir);
@@ -408,6 +450,8 @@ program
         projectDir,
         tasksPath,
         verbose: opts.verbose,
+        yes: opts.yes,
+        strictPrereqs: opts.strictPrereqs,
       });
     }
   );
@@ -473,6 +517,79 @@ async function fileExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Read tasks file, surface its Manual Prerequisites section, optionally
+ * prompt the user to confirm. Returns true if the caller should proceed.
+ *
+ * Behavior:
+ *  - No prereqs in the file → silent passthrough, returns true.
+ *  - Prereqs present + interactive (TTY) + !skipConfirm → prompt [Y/n].
+ *  - Prereqs present + non-TTY → print and proceed (so CI / piped use isn't
+ *    silently blocked). User can opt into hard-stop with --strict-prereqs.
+ *  - skipConfirm (--yes) → print and proceed regardless.
+ */
+async function surfacePrerequisites(
+  tasksPath: string,
+  opts: { skipConfirm: boolean; strict: boolean }
+): Promise<boolean> {
+  const prereqs = await loadPrerequisitesFromFile(tasksPath);
+  if (prereqs.length === 0) return true;
+
+  const { missingEnvCount } = printPrerequisites(prereqs);
+
+  if (opts.skipConfirm) {
+    if (missingEnvCount > 0) {
+      printWarn(
+        `Proceeding despite ${missingEnvCount} unset env var(s) (--yes).`
+      );
+    }
+    return true;
+  }
+
+  const isInteractive = process.stdin.isTTY && process.stdout.isTTY;
+  if (!isInteractive) {
+    if (opts.strict && missingEnvCount > 0) {
+      printError(
+        `--strict-prereqs and ${missingEnvCount} unset env var(s) — refusing to start.`
+      );
+      process.exitCode = 2;
+      return false;
+    }
+    printInfo(
+      `Non-interactive shell detected — continuing without confirmation.`
+    );
+    return true;
+  }
+
+  const answer = await prompt(
+    missingEnvCount > 0
+      ? `\nContinue anyway? Missing env vars will likely fail at runtime. [y/N] `
+      : `\nContinue with the run? [Y/n] `
+  );
+  const defaultYes = missingEnvCount === 0;
+  const proceed = defaultYes
+    ? !/^n(o)?$/i.test(answer.trim())
+    : /^y(es)?$/i.test(answer.trim());
+  if (!proceed) {
+    printInfo(`Aborted by user. No state changes were made.`);
+    return false;
+  }
+  return true;
+}
+
+function prompt(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
 }
 
 program.parseAsync(process.argv).catch((err) => {

@@ -103,8 +103,22 @@ function extractDependencies(rawTitle: string): {
   return { cleanTitle, dependencies: normalized };
 }
 
+/**
+ * The Manual Prerequisites section lives in the same tasks.md file (planner
+ * appends it after the task list). Cut the source at that boundary so the
+ * task parser never tries to interpret prereq bullets as tasks.
+ */
+const PREREQ_CUTOFF =
+  /^[ \t]*<!--\s*fullauto:prerequisites\s*-->[ \t]*$|^[ \t]*##+\s*Manual\s+Prerequisites\s*$/im;
+
+function stripPrerequisitesSection(source: string): string {
+  const m = source.match(PREREQ_CUTOFF);
+  if (!m || m.index === undefined) return source;
+  return source.slice(0, m.index);
+}
+
 export function parseTasksMarkdown(source: string): Task[] {
-  const lines = source.split(/\r?\n/);
+  const lines = stripPrerequisitesSection(source).split(/\r?\n/);
   const tasks: Task[] = [];
   let current: { task: Task; bodyLines: string[] } | null = null;
 
@@ -182,4 +196,74 @@ export async function loadTasksFromFile(path: string): Promise<Task[]> {
     );
   }
   return tasks;
+}
+
+export type PrerequisiteKind = 'ENV' | 'AUTH' | 'ACCOUNT' | 'OTHER';
+
+export interface Prerequisite {
+  kind: PrerequisiteKind;
+  /** For ENV: the variable name. For others: a short label/identifier or empty. */
+  identifier: string;
+  description: string;
+}
+
+/**
+ * Pull the "Manual Prerequisites" section out of a tasks.md and parse each
+ * bullet. Supports both the marker comment and the markdown header.
+ *
+ * Recognized line shape:  - [KIND] IDENTIFIER — description
+ *                         - [KIND] description without identifier
+ *
+ * Lines that don't match are silently skipped (they're free-form notes).
+ * Returns [] if no prerequisites section exists.
+ */
+const PREREQ_LINE =
+  /^\s*[-*+]\s*\[(ENV|AUTH|ACCOUNT|OTHER)\]\s*(.+?)\s*$/i;
+
+export function extractPrerequisites(source: string): Prerequisite[] {
+  const m = source.match(PREREQ_CUTOFF);
+  if (!m || m.index === undefined) return [];
+  const tail = source.slice(m.index + m[0].length);
+  // Stop at the next H2/H1 header so a hypothetical follow-on section
+  // doesn't get swept in.
+  const nextHeader = tail.search(/^##?\s+\S/m);
+  const sectionBody = nextHeader === -1 ? tail : tail.slice(0, nextHeader);
+
+  const prereqs: Prerequisite[] = [];
+  for (const rawLine of sectionBody.split(/\r?\n/)) {
+    const lineMatch = rawLine.match(PREREQ_LINE);
+    if (!lineMatch) continue;
+    const kind = lineMatch[1].toUpperCase() as PrerequisiteKind;
+    const rest = lineMatch[2].trim();
+    // Split on em-dash, en-dash, or " - " (hyphen surrounded by spaces).
+    // Identifier is the part before; description is the part after.
+    const sep = rest.match(/^(\S[^—–]*?)\s+[—–-]\s+(.+)$/);
+    let identifier = '';
+    let description = rest;
+    if (sep) {
+      identifier = sep[1].trim();
+      description = sep[2].trim();
+    } else if (kind === 'ENV') {
+      // ENV without explicit description: treat the whole rest as the var name.
+      identifier = rest;
+      description = '';
+    }
+    // Filter the planner's "None" sentinel — could land in either slot
+    // depending on whether the planner used an em dash separator.
+    if (
+      kind === 'OTHER' &&
+      /^none\b/i.test(identifier || description)
+    ) {
+      continue;
+    }
+    prereqs.push({ kind, identifier, description });
+  }
+  return prereqs;
+}
+
+export async function loadPrerequisitesFromFile(
+  path: string
+): Promise<Prerequisite[]> {
+  const source = await readFile(path, 'utf-8');
+  return extractPrerequisites(source);
 }

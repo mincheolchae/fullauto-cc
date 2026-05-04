@@ -180,6 +180,31 @@ vim .fullauto/auto-tasks.md
 fullauto run .fullauto/auto-tasks.md
 ```
 
+### 수동 선결조건 (Manual Prerequisites)
+
+`auto`/`plan` 모드에서 planner는 tasks.md 끝에 **사람이 직접 처리해야
+하는 항목** (오케스트레이터가 자동으로 못 하는 일 — 환경변수, API 키,
+CLI 로그인, OAuth, 결제 활성화, 도메인 구입 등) 목록을 함께 작성합니다.
+
+```markdown
+## Manual Prerequisites
+<!-- fullauto:prerequisites -->
+- [ENV] STRIPE_SECRET_KEY — Stripe 결제 시크릿 키
+- [ENV] DATABASE_URL — Postgres 연결 문자열
+- [AUTH] `vercel login` 실행 필요
+- [ACCOUNT] OpenAI 조직 결제 활성화
+- [OTHER] 운영 도메인 구매 후 Vercel로 DNS 연결
+```
+
+CLI는 분해 직후(plan)와 오케스트레이터 시작 직전(auto / run) 이 목록을
+표시하고, **`[ENV]` 항목은 현재 셸의 `process.env`와 대조해서 누락 여부를
+✓/✗로 알려줍니다**.
+
+`auto`와 `run`은 인터랙티브 터미널이면 진행 여부를 물어봅니다 (누락된 env
+가 있으면 기본값이 N). 비-TTY 환경(파이프, CI)에서는 표시만 하고 통과 —
+강제로 막고 싶으면 `--strict-prereqs`를 켭니다. 프롬프트 자체를 건너뛰고
+싶으면 `--yes`(`-y`).
+
 ---
 
 ## 4. CLI 명령 레퍼런스
@@ -204,6 +229,8 @@ fullauto run .fullauto/auto-tasks.md
 | `--output <path>` | plan / auto | planner 출력 파일 경로 (기본: `.fullauto/auto-tasks.md`) |
 | `--plan-timeout <sec>` | auto | planner 서브에이전트 타임아웃 (기본 900) |
 | `--timeout <sec>` | plan | planner 서브에이전트 타임아웃 (기본 900) |
+| `-y, --yes` | run / auto | 수동 선결조건 confirm 프롬프트 건너뛰기 |
+| `--strict-prereqs` | run / auto | 비-TTY 환경에서 누락된 `[ENV]` 항목이 있으면 시작 거부 |
 
 ---
 
@@ -330,6 +357,19 @@ task 라인 아래 들여쓴 sub-bullet은 task body에 포함됩니다 (스펙,
 
 내부적으로 모든 ID는 `T###` 형태로 정규화되어 `T1`, `T01`, `T001`, `1`,
 `01`, `001`이 모두 `T001`로 일관되게 처리됩니다.
+
+### Manual Prerequisites 섹션 (선택)
+
+파일 끝에 다음 마커 또는 `## Manual Prerequisites` 헤더를 두면, 그 이후의
+bullet은 task가 아닌 **사람이 직접 처리해야 하는 항목**으로 인식됩니다
+(상세는 위 "수동 선결조건" 절 참조). 라인 형식:
+
+```
+- [ENV|AUTH|ACCOUNT|OTHER] <식별자> — <설명>
+```
+
+`[ENV]`의 식별자는 환경변수명으로 취급되어 `process.env`와 자동 대조됩니다.
+이 섹션은 task 파서가 자동으로 잘라내므로 task로 오인되지 않습니다.
 
 ---
 

@@ -1,5 +1,6 @@
 import type { Task, GateResult, RunState } from './types.js';
 import { summarizeGates } from './runner/gates.js';
+import type { Prerequisite } from './parsers/speckit.js';
 
 const c = {
   reset: '\x1b[0m',
@@ -118,4 +119,95 @@ export function printWarn(msg: string): void {
 
 export function printError(msg: string): void {
   console.log(color('red', `✗ ${msg}`));
+}
+
+/**
+ * Strip C0/C1 control characters from prereq fields before they hit the
+ * terminal. Without this, a malicious tasks.md (fully user-controlled in
+ * `run` mode) can embed ANSI CSI / OSC sequences or carriage returns that
+ * overwrite earlier "✓ set" status, hide unset markers, or set the terminal
+ * title. Keep tab so legitimate whitespace survives.
+ */
+function sanitizeForTerminal(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
+}
+
+/**
+ * A valid POSIX-style env var name. Anything else printed in an [ENV] slot
+ * is almost certainly a parser-fallback artifact (planner emitted an unusual
+ * separator), and `process.env[that-string]` would always return undefined,
+ * giving the user a misleading "✗ NOT SET" with no explanation.
+ */
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Show the manual-prerequisites checklist surfaced by the planner. ENV
+ * variables are cross-checked against `process.env` so the user knows
+ * concretely which ones are still missing right now.
+ */
+export function printPrerequisites(prereqs: Prerequisite[]): {
+  missingEnvCount: number;
+} {
+  if (prereqs.length === 0) {
+    console.log('');
+    console.log(
+      color('dim', '  (planner reported no manual prerequisites)')
+    );
+    return { missingEnvCount: 0 };
+  }
+
+  console.log('');
+  console.log(
+    color('bold', '=== Manual Prerequisites — please review before run ===')
+  );
+
+  let missingEnvCount = 0;
+  for (const p of prereqs) {
+    const tag = color('magenta', `[${p.kind}]`);
+    const safeId = sanitizeForTerminal(p.identifier);
+    const safeDesc = sanitizeForTerminal(p.description);
+    let line = '';
+    if (p.kind === 'ENV') {
+      if (!ENV_NAME.test(safeId)) {
+        // Don't probe process.env with a malformed key; show the user that
+        // the planner produced an unusable line instead of a misleading
+        // "NOT SET" verdict that they can't act on.
+        const status = color('yellow', '⚠ malformed');
+        const desc = safeDesc ? ` — ${safeDesc}` : '';
+        line = `  ${tag} ${color('cyan', safeId || '(empty)')}${desc}  ${status}`;
+      } else {
+        const present = !!process.env[safeId];
+        if (!present) missingEnvCount += 1;
+        const status = present
+          ? color('green', '✓ set')
+          : color('red', '✗ NOT SET');
+        const desc = safeDesc ? ` — ${safeDesc}` : '';
+        line = `  ${tag} ${color('cyan', safeId)}${desc}  ${status}`;
+      }
+    } else {
+      const head = safeId
+        ? `${color('cyan', safeId)} — ${safeDesc}`
+        : safeDesc;
+      line = `  ${tag} ${head}`;
+    }
+    console.log(line);
+  }
+
+  if (missingEnvCount > 0) {
+    console.log('');
+    console.log(
+      color(
+        'yellow',
+        `  ⚠ ${missingEnvCount} environment variable(s) not currently set in this shell.`
+      )
+    );
+    console.log(
+      color(
+        'dim',
+        `    Tasks that read them at runtime will fail. Export them, or arrange for the implementer subagent to read them from a .env file the project already loads.`
+      )
+    );
+  }
+  return { missingEnvCount };
 }
