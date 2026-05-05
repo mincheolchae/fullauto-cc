@@ -237,6 +237,13 @@ export async function runSubagent(
 
   await mkdir(dirname(logPath), { recursive: true });
   const logStream = createWriteStream(logPath, { flags: 'w' });
+  // Suppress unhandled-error crashes (disk full, permission denied, etc.).
+  // The log is for human inspection only — the task verdict comes from gate
+  // exit codes, not the log file. Treat I/O errors as non-fatal: warn on
+  // stderr and let the child process continue so the task can still succeed.
+  logStream.on('error', (err) => {
+    process.stderr.write(`[fullauto] log write error for ${task.id} (${logPath}): ${err.message}\n`);
+  });
   logStream.write(`# Subagent transcript for ${task.id}\n`);
   logStream.write(`# Started: ${new Date().toISOString()}\n`);
   logStream.write(`# Prompt:\n${prompt}\n\n# === STDOUT ===\n`);
