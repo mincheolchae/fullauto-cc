@@ -26,9 +26,9 @@ export function interpolateEnv(s: string): string {
  * against an `expect.shape`. Behavior:
  *  - `undefined` expected → always pass.
  *  - primitives → strict `===`.
- *  - arrays → check the SAME LENGTH and each index recursively. (No
- *    contains/prefix variant; if you want length-only assertion against an
- *    array, use the `length` key on an object shape.)
+ *  - arrays → prefix match: every index in `expected` must exist in `actual`
+ *    and match recursively. `actual` may have MORE items. Use the `length` key
+ *    on an object shape to assert an exact count.
  *  - objects → every key in `expected` must exist in `actual` and match
  *    recursively. Keys in `actual` that aren't in `expected` are ignored
  *    (partial match).
@@ -43,7 +43,7 @@ export function matchShape(actual: unknown, expected: unknown): boolean {
   if (typeof expected !== 'object') return actual === expected;
   if (Array.isArray(expected)) {
     if (!Array.isArray(actual)) return false;
-    if (actual.length !== expected.length) return false;
+    if (actual.length < expected.length) return false;
     return expected.every((v, i) => matchShape(actual[i], v));
   }
   // String actual only exposes `length` introspectably — any other key in

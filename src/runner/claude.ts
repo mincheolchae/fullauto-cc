@@ -327,7 +327,12 @@ export async function runSubagent(
       // tail-of-file write — but since we now return stdout in-memory, the
       // log file is only used for human inspection, so the wait is for
       // post-mortem completeness rather than verdict parsing.
-      logStream.end(() => {
+      //
+      // Guard: if the stream was already destroyed (e.g. disk-full error
+      // handler called destroy()), the end(callback) contract is undefined
+      // on Node <18 and the callback may never fire — hanging the Promise.
+      // Call the resolver directly in that case.
+      const done = () =>
         resolve({
           exitCode,
           logPath,
@@ -335,7 +340,11 @@ export async function runSubagent(
           durationMs,
           stdout: stdoutChunks.join(''),
         });
-      });
+      if (logStream.destroyed) {
+        done();
+      } else {
+        logStream.end(done);
+      }
     };
 
     child.stdout.on('data', (data: Buffer) => {

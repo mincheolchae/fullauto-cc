@@ -111,6 +111,10 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
           throw err;
         }
         await processOneTask(task, projectDir, state, verbose ?? false);
+        // Persist completion immediately so a crash between here and the
+        // enhance-inject saveState below doesn't cause the task to re-run
+        // on resume.
+        await saveState(projectDir, state);
         // Feature-group completion check: if vibe-enhance is on AND the task
         // we just finished was a `user` task whose feature group is now
         // fully done (every other user task in the group is also `done`)
