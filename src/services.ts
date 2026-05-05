@@ -179,7 +179,7 @@ export class ServiceManager {
           )
         );
       }
-      const ok = await this.runProbe(h.def.readyProbe, cwd);
+      const ok = await this.runProbe(h.def.readyProbe, cwd, 10_000);
       if (ok) {
         h.ready = true;
         onLog(
@@ -212,7 +212,7 @@ export class ServiceManager {
     return `Service "${h.def.name}" ${summary}.${tailBlock}`;
   }
 
-  private runProbe(command: string, cwd: string): Promise<boolean> {
+  private runProbe(command: string, cwd: string, timeoutMs = 30_000): Promise<boolean> {
     return new Promise((resolve) => {
       const child = spawn(command, {
         cwd,
@@ -220,8 +220,25 @@ export class ServiceManager {
         env: process.env,
         stdio: 'ignore',
       });
-      child.on('close', (code) => resolve(code === 0));
-      child.on('error', () => resolve(false));
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        child.kill('SIGTERM');
+        resolve(false);
+      }, timeoutMs);
+      child.on('close', (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(code === 0);
+      });
+      child.on('error', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(false);
+      });
     });
   }
 
