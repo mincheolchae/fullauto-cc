@@ -155,12 +155,6 @@ export function buildSubagentPrompt(
   ].join('\n');
 }
 
-// Match the LAST occurrence of a DEFER marker in the stream — a subagent that
-// hedges mid-thought ("I might emit FULLAUTO_RESULT: DEFER X") then commits to
-// a different verdict at the end shouldn't be tripped by the earlier mention.
-// Accept an optional reason; bare `FULLAUTO_RESULT: DEFER` is a valid early-stop.
-const DEFER_LINE = /^FULLAUTO_RESULT:\s*DEFER(?:\s+(.+?))?\s*$/gm;
-
 // Defense-in-depth: even though `collectPlaceholderEnvs` validates names
 // against this same shape, the runner re-validates so a hand-edited state.json
 // can't slip a malformed name into the spawn env or break the prompt-block
@@ -191,10 +185,16 @@ export interface SubagentVerdict {
 }
 
 export function parseSubagentVerdict(transcript: string): SubagentVerdict {
+  // Regex is declared inside the function (not at module scope) so each call
+  // gets a fresh lastIndex=0. A module-level /g regex retains lastIndex across
+  // calls; if something ever interrupted the drain loop the next call would
+  // start scanning from a stale offset and silently miss DEFER markers.
+  // Match the LAST occurrence — a subagent that hedges mid-thought then commits
+  // to a different verdict at the end shouldn't be tripped by the earlier mention.
+  const deferLine = /^FULLAUTO_RESULT:\s*DEFER(?:\s+(.+?))?\s*$/gm;
   let lastMatch: RegExpExecArray | null = null;
   let m: RegExpExecArray | null;
-  // Scan for all DEFER markers; the last one wins.
-  while ((m = DEFER_LINE.exec(transcript)) !== null) lastMatch = m;
+  while ((m = deferLine.exec(transcript)) !== null) lastMatch = m;
   if (!lastMatch) return { kind: 'no_defer' };
   return {
     kind: 'defer',

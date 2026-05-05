@@ -85,7 +85,14 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
       if (ready === 0) {
         // Either nothing in current state matches the pass status filter, or
         // every candidate is dependency-blocked. Either way, no work to do this
-        // pass — advance and let promotion / no-progress detection handle it.
+        // pass. Check for no-progress before advancing: if the unresolved set
+        // hasn't changed since the start of this pass (e.g. all remaining tasks
+        // have circular / permanently-unsatisfied deps), bail immediately instead
+        // of burning through the remaining maxPasses with empty advances.
+        if (state.currentPass > 1 && queue.noProgressInCurrentPass()) {
+          printNoProgressBail();
+          break;
+        }
         const advanced = await maybeAdvancePass(queue, state, projectDir);
         if (!advanced) break;
         continue;
