@@ -273,7 +273,7 @@ function maybeInjectEnhanceTask(justFinished: Task, state: RunState): void {
   }
   if (lastIndex === -1) return; // defensive — sameGroup was non-empty so this shouldn't happen
 
-  const enhanceTask = buildEnhanceTask(feature, sameGroup, state.currentPass);
+  const enhanceTask = buildEnhanceTask(feature, sameGroup, state.currentPass, state.tasks);
   state.tasks.splice(lastIndex + 1, 0, enhanceTask);
   printInfo(
     `vibe-enhance pass queued for ${feature ? `feature "${feature}"` : 'end-of-run'} (${enhanceTask.id}).`

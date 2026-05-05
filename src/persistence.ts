@@ -59,8 +59,21 @@ export async function loadState(projectDir: string): Promise<RunState | null> {
   const p = paths(projectDir);
   if (!(await fileExists(p.statePath))) return null;
   const raw = await readFile(p.statePath, 'utf-8');
-  const parsed = JSON.parse(raw);
-  return RunState.parse(parsed);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `state.json is corrupted (invalid JSON). Remove .fullauto/ and re-run to start fresh, or restore from a backup.`
+    );
+  }
+  try {
+    return RunState.parse(parsed);
+  } catch (err) {
+    throw new Error(
+      `state.json schema mismatch — the file may be from an older version. Remove .fullauto/ and re-run to start fresh.\nDetails: ${(err as Error).message}`
+    );
+  }
 }
 
 export async function saveConfigSnapshot(
@@ -78,7 +91,13 @@ export async function loadUserConfig(
   const p = paths(projectDir);
   if (!(await fileExists(p.configPath))) return null;
   const raw = await readFile(p.configPath, 'utf-8');
-  return JSON.parse(raw);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `config.json is corrupted (invalid JSON). Remove .fullauto/config.json and re-run \`fullauto init\`.`
+    );
+  }
 }
 
 export function logPathFor(projectDir: string, taskId: string, attempt: number): string {

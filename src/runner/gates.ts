@@ -30,13 +30,15 @@ function runCommand(
     child.stdout.on('data', collect);
     child.stderr.on('data', collect);
 
+    let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
     const timeout = setTimeout(() => {
       child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 3000);
+      sigkillTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 3000);
     }, timeoutSec * 1000);
 
     child.on('error', (err) => {
       clearTimeout(timeout);
+      clearTimeout(sigkillTimer);
       resolve({
         exitCode: -1,
         output: `${buffer.join('')}\n[gate-runner] spawn error: ${err.message}`,
@@ -46,6 +48,7 @@ function runCommand(
 
     child.on('close', (code) => {
       clearTimeout(timeout);
+      clearTimeout(sigkillTimer);
       resolve({
         exitCode: code ?? -1,
         output: buffer.join(''),
