@@ -133,4 +133,39 @@ export class TaskQueue {
       return !dep || dep.status === 'done';
     });
   }
+
+  /**
+   * Detect cycles in the dependency graph using iterative DFS.
+   * Returns one representative cycle path string per cycle found, e.g.
+   * "T001 → T003 → T001". Empty array = no cycles.
+   */
+  detectCycles(): string[] {
+    const visited = new Set<string>();
+    const cycles: string[] = [];
+
+    const dfs = (id: string, stack: string[], onStack: Set<string>): void => {
+      if (onStack.has(id)) {
+        const start = stack.indexOf(id);
+        cycles.push([...stack.slice(start), id].join(' → '));
+        return;
+      }
+      if (visited.has(id)) return;
+      visited.add(id);
+      onStack.add(id);
+      stack.push(id);
+      const task = this.byId(id);
+      if (task) {
+        for (const depId of task.dependencies) {
+          dfs(depId, stack, onStack);
+        }
+      }
+      stack.pop();
+      onStack.delete(id);
+    };
+
+    for (const task of this.state.tasks) {
+      dfs(task.id, [], new Set());
+    }
+    return cycles;
+  }
 }

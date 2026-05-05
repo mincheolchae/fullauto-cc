@@ -56,6 +56,14 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
     sweepCompletedFeaturesForEnhance(state);
   }
 
+  const cycles = queue.detectCycles();
+  if (cycles.length > 0) {
+    printWarn(
+      `Circular dependencies detected — affected tasks will never run:\n` +
+        cycles.map((c) => `  ${c}`).join('\n')
+    );
+  }
+
   const services = new ServiceManager(projectDir, state.config.services);
   if (!services.isEmpty) {
     printInfo(

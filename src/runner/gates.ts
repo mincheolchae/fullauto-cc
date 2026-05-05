@@ -25,8 +25,18 @@ function runCommand(
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
+    const MAX_BUFFER_BYTES = 2 * 1024 * 1024; // 2MB — prevents OOM on runaway output
+    let bufferBytes = 0;
     const buffer: string[] = [];
-    const collect = (d: Buffer) => buffer.push(d.toString('utf-8'));
+    const collect = (d: Buffer) => {
+      const s = d.toString('utf-8');
+      buffer.push(s);
+      bufferBytes += s.length;
+      // Keep only the most-recent 2MB so `slice(-8000)` still sees the tail.
+      while (bufferBytes > MAX_BUFFER_BYTES && buffer.length > 1) {
+        bufferBytes -= buffer.shift()!.length;
+      }
+    };
     child.stdout.on('data', collect);
     child.stderr.on('data', collect);
 
