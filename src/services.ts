@@ -225,6 +225,13 @@ export class ServiceManager {
         if (settled) return;
         settled = true;
         child.kill('SIGTERM');
+        // SIGKILL follow-up: shell scripts launched with shell:true often
+        // don't propagate SIGTERM to their children. Without this, a hung
+        // probe that ignores SIGTERM becomes an orphan — especially
+        // dangerous in the waitReady polling loop where each 10s timeout
+        // fires a new probe every 1s. try/catch: the process may have
+        // already exited between SIGTERM and the 3s follow-up.
+        setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 3_000);
         resolve(false);
       }, timeoutMs);
       child.on('close', (code) => {
