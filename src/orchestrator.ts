@@ -307,7 +307,7 @@ function sweepCompletedFeaturesForEnhance(state: RunState): void {
       }
     }
     if (lastIndex === -1) continue;
-    const enhanceTask = buildEnhanceTask(feature, sameGroup, state.currentPass);
+    const enhanceTask = buildEnhanceTask(feature, sameGroup, state.currentPass, state.tasks);
     state.tasks.splice(lastIndex + 1, 0, enhanceTask);
     printInfo(
       `Resume sweep: queued vibe-enhance pass for ${feature ? `feature "${feature}"` : 'end-of-run'} (${enhanceTask.id}).`
@@ -325,7 +325,8 @@ function sweepCompletedFeaturesForEnhance(state: RunState): void {
 function buildEnhanceTask(
   feature: string | undefined,
   groupTasks: Task[],
-  currentPass: number
+  currentPass: number,
+  existingTasks: Task[] = []
 ): Task {
   const slug = feature
     ? feature
@@ -335,7 +336,12 @@ function buildEnhanceTask(
         .replace(/^-+|-+$/g, '')
         .slice(0, 40)
     : 'all';
-  const id = `ENHANCE-${slug || 'group'}`;
+  const baseId = `ENHANCE-${slug || 'group'}`;
+  const existingIds = new Set(existingTasks.map((t) => t.id));
+  let id = baseId;
+  for (let i = 2; existingIds.has(id); i++) {
+    id = `${baseId}-${i}`;
+  }
   const titleLabel = feature
     ? `feature "${feature}"`
     : 'all completed user tasks';

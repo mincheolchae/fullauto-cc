@@ -302,17 +302,18 @@ export async function runSubagent(
     let settled = false;
     const stdoutChunks: string[] = [];
 
+    let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
     const timeout = setTimeout(() => {
       timedOut = true;
       child.kill('SIGTERM');
-      // Hard-kill if it doesn't shut down quickly
-      setTimeout(() => child.kill('SIGKILL'), 5000);
+      sigkillTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
     }, config.subagentTimeoutSec * 1000);
 
     const finalize = (exitCode: number, errorTail?: string): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      clearTimeout(sigkillTimer);
       const durationMs = Date.now() - startedAt;
       if (errorTail) {
         logStream.write(`\n# === ERROR ===\n${errorTail}\n`);
