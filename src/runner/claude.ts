@@ -286,18 +286,11 @@ export async function runSubagent(
     // -p / --print: headless mode (one prompt in, response out, then exits).
     // We pass the prompt as the positional argument so it's not mangled by stdin handling.
     //
-    // Enhance tasks invoke /vibe-enhance, which uses the Skill tool and Agent
-    // tool internally. In acceptEdits mode those tools prompt for user approval
-    // which is impossible in a headless run — the skill fails silently. Use
-    // bypassPermissions for enhance tasks so the trusted vibe-enhance skill can
-    // run its full flow (researcher spawn → apply → verify-loop) unattended.
-    // Regular implementation tasks keep acceptEdits as before.
-    const permissionMode = task.kind === 'enhance' ? 'bypassPermissions' : 'acceptEdits';
     const args = [
       '-p',
       prompt,
       '--permission-mode',
-      permissionMode,
+      'bypassPermissions',
       ...mcpArgs,
     ];
     const child = spawn('claude', args, {
