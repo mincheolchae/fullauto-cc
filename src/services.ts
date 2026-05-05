@@ -241,17 +241,45 @@ export class ServiceManager {
     let refused = 0;
     for (const line of raw.split(/\r?\n/)) {
       const m = line.match(
-        /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/
+        /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/
       );
       if (!m) continue;
       const name = m[1];
       let val = m[2];
-      if (
-        (val.startsWith('"') && val.endsWith('"')) ||
-        (val.startsWith("'") && val.endsWith("'"))
-      ) {
-        val = val.slice(1, -1);
+
+      // Standard dotenv semantics:
+      //   KEY=value           → "value"
+      //   KEY=value # comment → "value"          (inline comment stripped)
+      //   KEY="x # y"         → "x # y"          (quoted: # is literal)
+      //   KEY='x # y'         → "x # y"          (quoted: # is literal)
+      //   KEY=val#nospace     → "val#nospace"    (# without leading whitespace is literal)
+      //
+      // The previous parser took the whole line after `=` as the value
+      // (with only trailing-whitespace trim), which polluted env vars
+      // written by tools that use trailing comments — e.g. `npx convex
+      // dev` writes `CONVEX_DEPLOYMENT=dev:foo-123 # team: x, project: y`
+      // and the comment leaked into Convex CLI's deployment-name parser
+      // through process.env, producing 400 InvalidDeploymentName.
+      const isQuoted =
+        val.length >= 2 && (val.startsWith('"') || val.startsWith("'"));
+      if (isQuoted) {
+        const quote = val[0];
+        const closeIdx = val.indexOf(quote, 1);
+        if (closeIdx >= 0) {
+          val = val.slice(1, closeIdx);
+        } else {
+          // Unterminated quote — degrade gracefully: drop the opening
+          // quote and trim trailing whitespace. Skipping the line would
+          // silently lose env vars on hand-edited files; better to
+          // surface a slightly off value than to drop it.
+          val = val.slice(1).trimEnd();
+        }
+      } else {
+        const commentAt = val.search(/\s#/);
+        if (commentAt >= 0) val = val.slice(0, commentAt);
+        val = val.trimEnd();
       }
+
       if (isProtectedEnvName(name)) {
         onLog(
           serviceName,
