@@ -17,15 +17,37 @@ export class TaskQueue {
    * Eligibility:
    *  - Pass 1: status === 'pending' AND all dependencies are 'done'.
    *  - Pass >= 2: status === 'deferred' AND all dependencies are 'done'.
+   *  - AND: no COMPLETED attempt in the current pass.
+   *
+   * The "no completed attempt in current pass" filter is what keeps the
+   * inner loop bounded. In pass 1 it's redundant (a `pending` task
+   * transitions to `done`/`deferred` after processOneTask, so the status
+   * filter alone excludes it), but in pass >= 2 it is load-bearing: a task
+   * that fails its gate stays `deferred`, so without this filter `next()`
+   * would keep returning the same deferred task forever and the
+   * end-of-pass no-progress / maxPasses guards would be unreachable. Each
+   * task gets at most one COMPLETED attempt per pass; cross-pass retries
+   * are how the orchestrator handles transient failures.
+   *
+   * "Completed" = `finishedAt` is set. An attempt that crashed mid-flight
+   * (resume case: `in_progress → pending` reset by cli.ts) has no
+   * `finishedAt`, so the task remains eligible — exactly what we want on
+   * resume.
    *
    * Returns undefined when nothing in this pass is currently eligible.
    */
   next(): Task | undefined {
     const targetStatus: TaskStatus =
       this.state.currentPass === 1 ? 'pending' : 'deferred';
+    const currentPass = this.state.currentPass;
 
     return this.state.tasks.find(
-      (t) => t.status === targetStatus && this.dependenciesSatisfied(t)
+      (t) =>
+        t.status === targetStatus &&
+        this.dependenciesSatisfied(t) &&
+        !t.attempts.some(
+          (a) => a.passNumber === currentPass && a.finishedAt !== undefined
+        )
     );
   }
 
