@@ -147,7 +147,7 @@ export async function runPlanner(opts: PlannerOptions): Promise<PlannerResult> {
   return new Promise<PlannerResult>((resolve) => {
     const child = spawn(
       'claude',
-      ['-p', prompt, '--permission-mode', 'acceptEdits'],
+      ['-p', prompt, '--permission-mode', 'bypassPermissions'],
       {
         cwd: projectDir,
         env: process.env,

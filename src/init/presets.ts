@@ -8,6 +8,8 @@
  * knows what to configure before running.
  */
 
+import type { Prerequisite } from '../parsers/speckit.js';
+
 export interface RequiredEnv {
   name: string;
   /** One-line human description: what it is, where to obtain it. */
@@ -25,6 +27,18 @@ export interface BackendPreset {
   description: string;
   /** Env vars the user MUST configure. Printed as a checklist. */
   requiredEnv: RequiredEnv[];
+  /**
+   * Non-env manual prerequisites surfaced at init time via the same
+   * structured printer as planner-generated prereqs. Use `[AUTH]` for
+   * interactive CLI logins / OAuth handshakes, `[ACCOUNT]` for billing
+   * or account-tier actions, `[OTHER]` for anything else the orchestrator
+   * cannot do autonomously. Empty list = no manual prereqs (env-only).
+   *
+   * These items are persistent setup actions (one-time logins that
+   * write a long-lived token to the user's home, or out-of-band account
+   * changes), not per-run actions, so init is the natural surface point.
+   */
+  manualPrereqs?: Prerequisite[];
   /** Builds the .fullauto/config.json content. */
   buildConfig(): Record<string, unknown>;
   /** Builds the .fullauto/mcp.json content, or null to skip. */
@@ -97,6 +111,20 @@ const CONVEX: BackendPreset = {
       name: 'CONVEX_DEPLOY_KEY',
       description:
         '(production deploys only) From dashboard.convex.dev → Project → Settings → Deploy Key. NOT needed for local dev — `convex dev` uses interactive login on first run.',
+    },
+  ],
+  manualPrereqs: [
+    {
+      // `npx convex dev` requires a browser login on first run that writes
+      // a long-lived token to ~/.convex/. Without this, the orchestrator's
+      // service spawn (stdio:'ignore') blocks waiting on stdin until the
+      // 90s readyTimeout fires and the run aborts. fullauto cannot do this
+      // step automatically — surface it so the user resolves it once before
+      // the first run.
+      kind: 'AUTH',
+      identifier: 'convex login',
+      description:
+        'Run `npx convex dev` once interactively before any fullauto run. It opens a browser to log in and creates a dev deployment, then writes CONVEX_URL to .env.local. Subsequent runs reuse the saved auth.',
     },
   ],
   buildConfig: () => ({

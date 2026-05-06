@@ -152,6 +152,16 @@ program
       // 4. Surface required env vars as a checklist the user can act on.
       printRequiredEnv(preset);
 
+      // 4b. Surface non-env manual prereqs (interactive logins, account
+      //     setup, etc.) using the same structured printer the planner
+      //     output goes through. These are blocking actions the
+      //     orchestrator can't do unattended — without surfacing them
+      //     here, a first run on a clean machine would silently hang on
+      //     a login prompt until the service readyTimeout fires.
+      if (preset.manualPrereqs && preset.manualPrereqs.length > 0) {
+        printPrerequisites(preset.manualPrereqs);
+      }
+
       // 5. Print preset-specific guidance (which CLIs to run, etc).
       console.log('');
       for (const line of preset.postInitGuidance().split('\n')) {

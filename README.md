@@ -818,9 +818,11 @@ run당 모든 것은 `.fullauto/`에 위치:
   본인의 shell만큼 신뢰하지 못하는 `.fullauto/config.json`은 로드하지 마세요.
 - **Prompt-injected 서브에이전트가 게이트 스크립트를 손상시킬 수 있음**
   (예: `package.json`의 `test` 스크립트를 `exit 0`으로 다시 작성).
-  `acceptEdits` 권한으로 적대적 콘텐츠를 다루는 것의 본질적 위험. 신뢰할 수
-  없는 task 설명에 대해 production 사용 시 게이트 파일을 hash 체크하는 등의
-  방어를 고려하세요.
+  `bypassPermissions`로 적대적 콘텐츠를 다루는 것의 본질적 위험 — unattended를
+  보장하려면 권한 프롬프트 없이 도구가 통과되어야 하는데, 그 대가로 prompt
+  injection이 만든 파괴적 명령도 같이 통과될 수 있음. 신뢰할 수 없는 task
+  설명에 대해 production 사용 시 게이트 파일을 hash 체크하는 등의 방어를
+  고려하세요.
 - **`/verify-loop`는 서브에이전트 안에서 실행**, 오케스트레이터 외부에서
   돌지 않습니다. 오케스트레이터는 최종 verdict와 게이트 결과만 보고, 리뷰어
   transcript는 서브에이전트 로그에서 확인 가능.
