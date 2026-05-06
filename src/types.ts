@@ -107,7 +107,7 @@ const ShellGate = z.object({
   command: z.string(),
   cwd: z.string().optional(),
   skipIf: z.string().optional(),
-  /** Per-gate timeout override; default 600s (10 min). */
+  /** Per-gate timeout override in seconds; default 1800 (30 min). */
   timeoutSec: z.number().int().positive().optional(),
 });
 export type ShellGate = z.infer<typeof ShellGate>;
@@ -177,7 +177,18 @@ const ConvexFnGate = z.object({
    * (which `convex dev` writes to `.env.local`).
    */
   url: z.string().optional(),
-  timeoutSec: z.number().int().positive().default(30),
+  /**
+   * Per-call timeout in seconds (default: 60).
+   *
+   * Default raised from 30 → 60 under accuracy > speed: Convex actions can
+   * legitimately run up to 60s on the platform side (queries/mutations are
+   * capped lower at ~10s server-side). A 30s default forced action gates
+   * to defer at the halfway point, then the next pass timed out the same
+   * way — pure waste with no signal. 60s matches the HttpGate default and
+   * the platform's own action ceiling, so a timeout here means a real
+   * platform-level failure rather than a client-side budget shortfall.
+   */
+  timeoutSec: z.number().int().positive().default(60),
 });
 export type ConvexFnGate = z.infer<typeof ConvexFnGate>;
 

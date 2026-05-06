@@ -9,7 +9,15 @@ interface RunCommandResult {
   durationMs: number;
 }
 
-const DEFAULT_SHELL_TIMEOUT_SEC = 600; // 10min cap per gate
+// Per-gate cap (default 30min). Raised from 10min under accuracy > speed:
+// monorepo `tsc --build` cold-build, full jest/vitest with coverage, and
+// e2e suites (playwright/cypress) routinely sit in the 10–25min band. A
+// 10min cap killed healthy runs mid-test, then the next pass repeated the
+// timeout — pure churn. Cost worry is "runaway gate burns 30min" but real
+// gates terminate when the work ends; 30min only fires on actually stuck
+// processes. Users who know their suite is fast can shrink it per-gate via
+// the `timeoutSec` field on the gate.
+const DEFAULT_SHELL_TIMEOUT_SEC = 1800;
 
 function runCommand(
   command: string,

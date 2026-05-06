@@ -809,6 +809,8 @@ run당 모든 것은 `.fullauto/`에 위치:
 | `Existing state found — resuming` (원치 않은 동작) | 기존 `.fullauto/state.json` 잔존. `--force`로 폐기 |
 | 자동 추론된 결정이 의도와 다름 | `.fullauto/auto-tasks.md` 하단의 `## Assumptions` 섹션을 확인 — 비자명한 결정이 한 줄씩 기록되어 있음. 마음에 안 들면 파일을 직접 편집한 뒤 `fullauto run .fullauto/auto-tasks.md`로 실행하거나, description을 더 구체적으로 써서 재실행 |
 | 서브에이전트 timeout (기본 60분) | `subagentTimeoutSec`을 config에서 늘리거나 task를 더 잘게 쪼개도록 description 조정. 30→60분으로 default 상향됨 (정확도 우선) |
+| Shell gate timeout (기본 30분) | 모노레포 `tsc --build` / e2e 등이 30분을 넘기면 게이트별 `timeoutSec`을 `gates[].timeoutSec` (초)로 설정. 10→30분으로 default 상향됨 (정확도 우선) |
+| `convex-fn` gate timeout (기본 60초) | Convex action이 60초 넘게 걸리면 플랫폼 한계 — 게이트별 `timeoutSec` 상향 또는 query/mutation으로 분리. 30→60초로 default 상향됨 (정확도 우선) |
 | 같은 task가 deferred만 반복 | 기본 `maxPasses=4`. 로그(`.fullauto/logs/T###-attempt*.log`) 보고 근본 원인 수정 후 `fullauto resume`. 4 → 5+ 상향이 도움될 수도 |
 | `claude` 명령 못 찾음 | 서브에이전트가 `subagent_error`로 종료됨. PATH에 `claude` CLI 추가 |
 | `/verify-loop`가 안 돈다는 의심 | `~/.claude/skills/verify-loop/SKILL.md` 존재 확인. 없으면 단순 self-review로 폴백 |
