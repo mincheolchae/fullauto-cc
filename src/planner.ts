@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, access } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { resolveMcpArgs } from './runner/mcp-args.js';
 
 export interface PlannerOptions {
   description: string;
@@ -8,6 +9,14 @@ export interface PlannerOptions {
   /** Absolute path where the planner should write tasks.md. */
   outputPath: string;
   timeoutSec?: number;
+  /**
+   * Path (relative to projectDir) to an MCP config file. Forwarded to the
+   * planner subagent via `--mcp-config` after the same vetting the
+   * implementer subagent uses, so the planner can introspect e.g. Convex
+   * schema or Supabase tables when decomposing the request. Same path
+   * source as `RunConfig.mcpConfigPath`.
+   */
+  mcpConfigPath?: string;
   /** Streaming callback for stdout/stderr. */
   onOutput?: (chunk: string) => void;
 }
@@ -40,7 +49,7 @@ export function buildPlannerPrompt(
     ``,
     `## Your job`,
     ``,
-    `1. If helpful, briefly read the project files in your current working directory to understand the codebase shape (existing files, language, conventions). Don't go deep — you are NOT implementing anything.`,
+    `1. If helpful, briefly read the project files in your current working directory to understand the codebase shape (existing files, language, conventions). Don't go deep — you are NOT implementing anything. **Cap initial exploration at roughly 10 file reads and 3 directory listings** — you need a vibe of the stack and conventions, not a full audit. If MCP servers are wired up (Convex / Supabase / etc.), use them sparingly to introspect external schemas instead of guessing from source files.`,
     `2. Use the Write tool to create the file at this exact absolute path:`,
     ``,
     `   ${outputPath}`,
@@ -54,9 +63,28 @@ export function buildPlannerPrompt(
     `## Rules for the task list`,
     `- Each task = one verb + one concrete artifact (file, function, endpoint, schema, test). NOT abstract or exploratory.`,
     `- Order tasks topologically. Declare every real dependency with \`(depends on T###)\`. Independent tasks need no annotation.`,
+    `- Every \`(depends on T###)\` must reference a task ID that ALSO appears in this list. Dangling refs leave the orchestrator's queue with permanently-blocked tasks; the validator will reject your output.`,
     `- Skip "research", "explore", "decide", "plan" tasks — make those calls NOW yourself, then write concrete tasks.`,
     `- Aim for 3–20 tasks total. If you need more, the request is probably too big for one auto-run; fold related steps into a single task.`,
     `- Indented sub-bullets under a task line are allowed and become part of the task body (specifications, acceptance criteria, file paths). Use them when one line isn't enough.`,
+    ``,
+    `## Feature grouping (when the request spans multiple distinct features)`,
+    ``,
+    `If the user request covers more than one independently-deliverable feature (e.g. "build a chat app with rooms AND a profile page" → two features; "add rate limiting to /users" → one feature), split tasks under \`## Feature: <name>\` h2 headings. Tasks following a heading belong to that feature until the next heading.`,
+    ``,
+    `Example shape:`,
+    ``,
+    `   ## Feature: Auth flow`,
+    `   - [ ] T001 ...`,
+    `   - [ ] T002 ... (depends on T001)`,
+    ``,
+    `   ## Feature: Chat rooms`,
+    `   - [ ] T003 ...`,
+    `   - [ ] T004 ... (depends on T003)`,
+    ``,
+    `Why this matters: when \`--vibe-enhance\` is on, a researcher pass runs after EACH feature group completes. Without headings, every task lands in one implicit group and the enhance pass fires only once at the end of the run — losing the per-feature trend-check granularity.`,
+    ``,
+    `Single-feature requests don't need headings. When in doubt, omit them — extraneous headings just create noise.`,
     ``,
     `## Test coverage (REQUIRED)`,
     ``,
@@ -138,16 +166,23 @@ export function buildPlannerPrompt(
 }
 
 export async function runPlanner(opts: PlannerOptions): Promise<PlannerResult> {
-  const { description, projectDir, outputPath, timeoutSec = 900, onOutput } =
+  const { description, projectDir, outputPath, timeoutSec = 900, mcpConfigPath, onOutput } =
     opts;
   await mkdir(dirname(outputPath), { recursive: true });
   const prompt = buildPlannerPrompt(description, outputPath);
   const startedAt = Date.now();
 
+  // Resolve --mcp-config BEFORE the spawn promise so the same vetting
+  // (lexical + realpath containment) the implementer subagent uses also
+  // applies here. Without this the planner is blind to schemas that live
+  // outside the repo (Convex deployment, Supabase project) and falls back
+  // to source-file inspection only.
+  const mcpArgs = await resolveMcpArgs(projectDir, mcpConfigPath);
+
   return new Promise<PlannerResult>((resolve) => {
     const child = spawn(
       'claude',
-      ['-p', prompt, '--permission-mode', 'bypassPermissions'],
+      ['-p', prompt, '--permission-mode', 'bypassPermissions', ...mcpArgs],
       {
         cwd: projectDir,
         env: process.env,

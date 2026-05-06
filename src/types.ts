@@ -201,6 +201,15 @@ export const RunConfig = z.object({
   maxPasses: z.number().int().positive().default(3),
   /** Per-task subagent timeout in seconds (default: 1800 = 30min). */
   subagentTimeoutSec: z.number().int().positive().default(1800),
+  /**
+   * Planner subagent timeout in seconds (default: 900 = 15min).
+   *
+   * The planner explores the project and writes the task list. Generous
+   * default because for large repos the project-vibe scan can take a few
+   * minutes before any task is emitted. CLI flag (`--plan-timeout` /
+   * `--timeout`) overrides this when set.
+   */
+  plannerTimeoutSec: z.number().int().positive().default(900),
   /** Whether to instruct the implementer subagent to invoke /verify-loop. */
   useVerifyLoop: z.boolean().default(true),
   /**

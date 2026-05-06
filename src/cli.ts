@@ -22,9 +22,10 @@ import {
   saveState,
   paths,
 } from './persistence.js';
-import { RunConfig, RunState } from './types.js';
+import { RunConfig, RunState, type Task } from './types.js';
 import { runOrchestrator } from './orchestrator.js';
 import { runPlanner, checkPlannerOutput } from './planner.js';
+import { validatePlanShape } from './plan-validator.js';
 import {
   printError,
   printFinalReport,
@@ -471,14 +472,13 @@ program
   )
   .option(
     '--timeout <sec>',
-    'Planner timeout in seconds (default: 900 = 15min)',
-    (v) => parseInt(v, 10),
-    900
+    'Planner timeout in seconds. Overrides config.plannerTimeoutSec; falls back to that, then 900s.',
+    (v) => parseInt(v, 10)
   )
   .action(
     async (
       descriptionParts: string[],
-      opts: { dir: string; output: string; timeout: number }
+      opts: { dir: string; output: string; timeout?: number }
     ) => {
       const projectDir = resolve(opts.dir);
       await ensureFullautoDir(projectDir);
@@ -493,7 +493,7 @@ program
         projectDir,
         description,
         outputPath,
-        timeoutSec: opts.timeout,
+        timeoutSec: await resolvePlannerTimeoutSec(projectDir, opts.timeout),
       });
       if (tasksPath) {
         const prereqs = await loadPrerequisitesFromFile(tasksPath);
@@ -501,6 +501,31 @@ program
       }
     }
   );
+
+/**
+ * Resolve the planner timeout from (a) explicit CLI flag, falling back to
+ * (b) `.fullauto/config.json`'s `plannerTimeoutSec`, then (c) the schema
+ * default (900s). The CLI flag wins when present so users can ad-hoc bump
+ * a tight planner without permanently editing config.
+ *
+ * Loads config via the user-config path so the same precedence applies to
+ * `plan` (which never touches RunConfig defaults) and `auto` (which does).
+ * If the file is missing or unparseable, falls through silently — the
+ * planner is independent of orchestrator gating.
+ */
+async function resolvePlannerTimeoutSec(
+  projectDir: string,
+  cliFlag: number | undefined
+): Promise<number> {
+  if (cliFlag !== undefined) return cliFlag;
+  const raw = await loadUserConfig(projectDir);
+  if (raw) {
+    const parsed = RunConfig.safeParse(raw);
+    if (parsed.success) return parsed.data.plannerTimeoutSec;
+  }
+  // Fall back to the schema default.
+  return RunConfig.parse({}).plannerTimeoutSec;
+}
 
 /**
  * Returns the path of the planner-written tasks file on success, or null if
@@ -519,11 +544,23 @@ async function runPlanFlow(args: {
   );
   printInfo(`Output: ${outputPath}`);
 
+  // Forward `mcpConfigPath` from the user config so the planner sees the same
+  // MCP servers (Convex / Supabase / etc.) as the implementer subagents. Lets
+  // the planner introspect external schemas while decomposing — without this
+  // it's limited to whatever lives in source files.
+  const userConfigRaw = await loadUserConfig(projectDir);
+  let mcpConfigPath: string | undefined;
+  if (userConfigRaw) {
+    const parsed = RunConfig.safeParse(userConfigRaw);
+    if (parsed.success) mcpConfigPath = parsed.data.mcpConfigPath;
+  }
+
   const result = await runPlanner({
     description,
     projectDir,
     outputPath,
     timeoutSec,
+    mcpConfigPath,
     // Planner output is usually short; let it through to stdout so the user
     // can see what the subagent is doing without needing --verbose.
     onOutput: (chunk) => process.stderr.write(chunk),
@@ -548,7 +585,38 @@ async function runPlanFlow(args: {
     process.exitCode = 1;
     return null;
   }
-  printInfo(`Wrote tasks file: ${outputPath}`);
+
+  // Validate the shape BEFORE the orchestrator inherits it. The queue's
+  // dangling-dep fallback ("treat unknown deps as satisfied") and the
+  // orchestrator's cycle-warn-then-proceed are too forgiving for this
+  // surface — a malformed plan slips through and runs to completion with
+  // wrong work. Fail fast so the user sees the issue while the original
+  // request is still in their head.
+  let parsedTasks: Task[];
+  try {
+    parsedTasks = await loadTasksFromFile(outputPath);
+  } catch (err) {
+    printError(
+      `Planner output failed to parse: ${(err as Error).message}\n  Tasks file: ${outputPath}`
+    );
+    process.exitCode = 1;
+    return null;
+  }
+  const validation = validatePlanShape(parsedTasks);
+  if (!validation.ok) {
+    printError(
+      `Planner output failed validation (${validation.errors.length} error(s)):`
+    );
+    for (const e of validation.errors) console.error(`    • ${e}`);
+    console.error(
+      `  Tasks file: ${outputPath}\n  Edit it manually and re-run \`fullauto run\`, or re-issue the plan command with a sharper description.`
+    );
+    process.exitCode = 1;
+    return null;
+  }
+  for (const w of validation.warnings) printWarn(w);
+
+  printInfo(`Wrote tasks file: ${outputPath} (${parsedTasks.length} task(s) validated).`);
   return outputPath;
 }
 
@@ -575,9 +643,8 @@ program
   )
   .option(
     '--plan-timeout <sec>',
-    'Planner timeout in seconds (default: 900)',
-    (v) => parseInt(v, 10),
-    900
+    'Planner timeout in seconds. Overrides config.plannerTimeoutSec; falls back to that, then 900s.',
+    (v) => parseInt(v, 10)
   )
   .option(
     '--vibe-enhance',
@@ -592,7 +659,7 @@ program
         verbose: boolean;
         force: boolean;
         output: string;
-        planTimeout: number;
+        planTimeout?: number;
         vibeEnhance: boolean;
       }
     ) => {
@@ -633,7 +700,7 @@ program
         projectDir,
         description,
         outputPath,
-        timeoutSec: opts.planTimeout,
+        timeoutSec: await resolvePlannerTimeoutSec(projectDir, opts.planTimeout),
       });
       if (!tasksPath) return; // planner failed — exit codes set inside
 
