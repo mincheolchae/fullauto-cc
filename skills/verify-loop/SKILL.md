@@ -217,9 +217,9 @@ When BLOCKs are clear (or after iteration cap), report once:
 ```
 ## verify-loop 완료 (n 사이클)
 
-🛡️ 게이트: typecheck ✓ / test ✓ / lint ✓
+**게이트:** typecheck ✓ / test ✓ / lint ✓
    (또는: typecheck ✓ / test ✗ "<오류 한 줄>" — pre-existing, 별도 추적 필요)
-🎯 요구사항 충족도: <전부 충족 | 부분 충족 (n/m) | 검증 안 됨(요구사항 미캡처)>
+**요구사항 충족도:** <전부 충족 | 부분 충족 (n/m) | 검증 안 됨(요구사항 미캡처)>
    (부분 충족인 경우 미충족 요구사항 한 줄씩 — 이건 cycle 안에서 못 푼 것)
 ✅ BLOCK: 모두 해결 (n건)
    (또는: ❌ BLOCK 미해결 (n건) — 사이클 cap 도달, 아래 권한 필요한 항목 참고)
