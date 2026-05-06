@@ -494,8 +494,8 @@ program
 
 /**
  * Returns the path of the planner-written tasks file on success, or null if
- * the planner failed / produced AMBIGUOUS / wrote nothing. Caller decides
- * whether to chain into a run.
+ * the planner failed or wrote nothing. Caller decides whether to chain into
+ * a run.
  */
 async function runPlanFlow(args: {
   projectDir: string;
@@ -538,14 +538,6 @@ async function runPlanFlow(args: {
     process.exitCode = 1;
     return null;
   }
-  if (check.ambiguous) {
-    printWarn(`Planner needs clarification: ${check.ambiguous}`);
-    printInfo(
-      `Re-run \`fullauto plan\` with a more detailed description, or edit ${outputPath} manually before \`fullauto run\`.`
-    );
-    return null;
-  }
-
   printInfo(`Wrote tasks file: ${outputPath}`);
   return outputPath;
 }
@@ -633,7 +625,7 @@ program
         outputPath,
         timeoutSec: opts.planTimeout,
       });
-      if (!tasksPath) return; // planner failed or AMBIGUOUS — exit codes set inside
+      if (!tasksPath) return; // planner failed — exit codes set inside
 
       printInfo(`Plan accepted — handing off to orchestrator.`);
       await startFreshRun({

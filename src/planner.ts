@@ -104,21 +104,38 @@ export function buildPlannerPrompt(
     ``,
     `If there are GENUINELY no manual prerequisites (e.g. a self-contained refactor), still write the section with one line: \`- [OTHER] None — fully self-contained.\`. Never omit the section.`,
     ``,
-    `## If the request is genuinely ambiguous`,
+    `## Resolving ambiguity autonomously (REQUIRED)`,
     ``,
-    `If you cannot break this down without more information from the user, write the file with this single line as its entire content:`,
+    `fullauto is unattended. There is NO mechanism to ask the user a follow-up question — the user has already gone away. If something in the request is underspecified, you MUST resolve it yourself and proceed. Refusing to decompose is not an option.`,
     ``,
-    `   AMBIGUOUS: <one specific question the user must answer>`,
+    `Resolve in this order:`,
+    `1. **Project signal** — read \`README.md\`, \`CLAUDE.md\`, \`package.json\` / \`pyproject.toml\` / \`Cargo.toml\` / \`go.mod\` / equivalent, and skim a few representative source files. The existing stack, conventions, and recent direction are the strongest signal of what the user wants.`,
+    `2. **Recent direction** — \`git log --oneline -20\` (if a git repo is detectable) tells you what the team has been investing in. Match that energy.`,
+    `3. **Domain conventions** — fall back to the de-facto standard for this kind of project (e.g., for a Next.js app: App Router + Server Components; for a Python async API: pydantic + httpx; for a React form: react-hook-form-style patterns). Lean toward what a competent engineer in this stack would do *today* (current best practices), not what was conventional 3 years ago.`,
+    `4. **Reasonable default** — if all else is silent, pick the most defensible default and move on. Document the choice in the Assumptions section below.`,
     ``,
-    `The orchestrator detects that marker and surfaces the question — do not guess.`,
+    `Treat every "the user didn't say X" moment as a decision YOU make, not a question. Make the call, capture the assumption, keep moving.`,
+    ``,
+    `## Assumptions section (REQUIRED when you made non-obvious calls)`,
+    ``,
+    `If you resolved any underspecified part of the request via the rules above, append an Assumptions section after Manual Prerequisites so the user can review your judgment after the run. Use this exact shape:`,
+    ``,
+    `   ## Assumptions`,
+    `   <!-- fullauto:assumptions -->`,
+    `   - <one-line decision> — <one-line reasoning grounded in project signal / domain convention>`,
+    ``,
+    `Examples:`,
+    `   - Used Postgres (not MySQL) — \`pg\` already in package.json and recent migrations target Postgres.`,
+    `   - Chose JWT over session cookies for the auth task — project is a stateless API with no existing session store.`,
+    `   - Added \`zod\` for request validation — already used in src/lib/validators/ for adjacent endpoints.`,
+    ``,
+    `If everything in the request was explicit and you genuinely had no ambiguity to resolve, omit the section.`,
     ``,
     `## Output protocol`,
     ``,
-    `The Write tool result is your only deliverable. Stdout commentary is ignored by the orchestrator. Do not wrap the task list in markdown code fences. Do not add a preamble or trailing prose inside the file — the parser expects the first line to start with \`- [ ]\` or with \`AMBIGUOUS:\`.`,
+    `The Write tool result is your only deliverable. Stdout commentary is ignored by the orchestrator. Do not wrap the task list in markdown code fences. Do not add a preamble or trailing prose inside the file — the parser expects the first line to start with \`- [ ]\`. Never write a refusal, a question, or a clarification request as the file contents — make the call and produce the task list.`,
   ].join('\n');
 }
-
-const AMBIGUOUS_MARKER = /^\s*AMBIGUOUS:\s*(.+?)\s*$/im;
 
 export async function runPlanner(opts: PlannerOptions): Promise<PlannerResult> {
   const { description, projectDir, outputPath, timeoutSec = 900, onOutput } =
@@ -169,8 +186,6 @@ export async function runPlanner(opts: PlannerOptions): Promise<PlannerResult> {
 
 export interface PlannerOutputCheck {
   exists: boolean;
-  /** If the planner wrote an AMBIGUOUS line, the question after the colon. */
-  ambiguous?: string;
   /** Raw file contents if the file exists. */
   content?: string;
 }
@@ -184,9 +199,5 @@ export async function checkPlannerOutput(
     return { exists: false };
   }
   const content = await readFile(outputPath, 'utf-8');
-  const ambiguous = content.match(AMBIGUOUS_MARKER);
-  if (ambiguous) {
-    return { exists: true, ambiguous: ambiguous[1].trim(), content };
-  }
   return { exists: true, content };
 }
