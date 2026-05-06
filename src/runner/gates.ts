@@ -95,7 +95,13 @@ async function runShellGate(
     passed: r.exitCode === 0,
     command: gate.command,
     exitCode: r.exitCode,
-    output: r.output.slice(-8000), // cap log size
+    // Cap visible output at ~32KB tail. Jest snapshot diffs, pytest assertion
+    // dumps, tsc multi-error reports, and lint runs routinely exceed 8KB —
+    // the prior cap clipped the actual failure off the bottom and left only
+    // setup noise. The full 2MB upstream buffer is still enforced; this is
+    // just the slice that ships into state.json (and thus into the next-pass
+    // implementer prompt via deferDetail). 32KB is the accuracy/cost knee.
+    output: r.output.slice(-32_000),
     durationMs: r.durationMs,
   };
 }

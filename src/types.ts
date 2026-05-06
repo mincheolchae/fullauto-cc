@@ -138,7 +138,16 @@ const HttpGate = z.object({
    * CORS, or `www-authenticate` checks.
    */
   expectHeaders: z.record(z.string()).optional(),
-  timeoutSec: z.number().int().positive().default(15),
+  /**
+   * Per-request timeout in seconds (default: 60).
+   *
+   * Default raised from 15 → 60 under accuracy > speed: cold-start
+   * serverless (Vercel/Cloudflare Workers, ~5–15s), Next.js dev first-hit
+   * compile (often 30s+), and Spring/Rails initial routing scan all
+   * routinely exceed 15s. A timeout here defers the task — pure accuracy
+   * loss for a budget that costs nothing on healthy services.
+   */
+  timeoutSec: z.number().int().positive().default(60),
 });
 export type HttpGate = z.infer<typeof HttpGate>;
 
@@ -189,18 +198,30 @@ export type Gate = z.infer<typeof Gate>;
 
 export const RunConfig = z.object({
   /**
-   * Max passes through the queue before escalating to user (default: 3).
+   * Max passes through the queue before escalating to user (default: 4).
    *
    * Each pass re-attempts whatever's still deferred. The orchestrator
    * also exits early via `noProgressInCurrentPass` when a pass starts
    * and ends with the same unresolved set, so this value caps the
-   * convergence budget without forcing wasted work — `3` is essentially
-   * "two retries past the initial attempt," which covers two-level
-   * dependency-chain retries and one stochastic-flake retry.
+   * convergence budget without forcing wasted work — `4` covers up to
+   * three-level dependency-chain retries plus one stochastic-flake retry.
+   * Default raised from 3 → 4 under the accuracy > speed > cost priority:
+   * the no-progress guard makes the extra pass nearly free when nothing's
+   * converging, and gives an extra retry to deeper dep chains that ARE
+   * converging slowly.
    */
-  maxPasses: z.number().int().positive().default(3),
-  /** Per-task subagent timeout in seconds (default: 1800 = 30min). */
-  subagentTimeoutSec: z.number().int().positive().default(1800),
+  maxPasses: z.number().int().positive().default(4),
+  /**
+   * Per-task subagent timeout in seconds (default: 3600 = 60min).
+   *
+   * Default raised from 1800 (30min) under the accuracy > speed > cost
+   * priority: a complex task with verify-loop running 3 cycles
+   * (implementation + 4 reviewer subagents per cycle + gates) routinely
+   * approaches 30min, and timeout-defer means the next pass starts from
+   * scratch — pure waste. 60min lets harder tasks finish on the first
+   * attempt rather than churn across passes.
+   */
+  subagentTimeoutSec: z.number().int().positive().default(3600),
   /**
    * Planner subagent timeout in seconds (default: 900 = 15min).
    *

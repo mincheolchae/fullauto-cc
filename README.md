@@ -42,11 +42,11 @@ flowchart TD
 
 종료는 세 가지로 가드됩니다:
 1. 모든 task가 `done` 또는 `failed`에 도달.
-2. `currentPass > maxPasses` (기본 3).
+2. `currentPass > maxPasses` (기본 4).
 3. **무진전 감지** — 한 패스가 시작 시점과 동일한 미해결 집합으로 끝나면,
    무한 루프 대신 즉시 중단.
 
-#### `maxPasses`가 뭐고 기본값이 왜 3인가
+#### `maxPasses`가 뭐고 기본값이 왜 4인가
 
 오케스트레이터는 task 큐를 **여러 사이클(=pass) 돌면서** 단계적으로
 수렴시킵니다:
@@ -56,23 +56,25 @@ flowchart TD
 | **Pass 1** | 모든 `pending` task 시도. 실패한 것들(서브에이전트 에러 / 게이트 실패 / DEFER 마커)은 `deferred`로 격리 |
 | **Pass 2** | `deferred`만 재시도. 다른 task가 pass 1에서 done이 되면서 의존성이 풀린 케이스가 여기서 잡힘 |
 | **Pass 3** | 더 깊은 의존 chain (3-깊이) 또는 stochastic 서브에이전트 실패의 retry |
+| **Pass 4** | 4-깊이 의존 chain, 또는 느리게 수렴 중인 대형 task의 마지막 retry — 정확도 우선 default가 한 번 더 기회를 줌 |
 | Pass N+1 | 위 가드 (1) 또는 (2)에 닿음 — done/failed로 종결 |
 
-`maxPasses=3`을 기본으로 잡은 이유:
+`maxPasses=4`를 기본으로 잡은 이유 (정확도 > 속도 > 비용 원칙):
 
 - **무진전 감지 가드가 비용을 제한**합니다 — 한 pass가 시작과 동일한 미해결
-  집합으로 끝나면 즉시 break. 즉 "어차피 안 풀릴 것"은 pass 3을 소비하지
-  않고, "계속 풀리는 중인 것"에만 한 번 더 기회를 줍니다.
-- **2 vs 3의 trade-off는 비대칭**: 2면 두 단계 의존 체인의 leaf task가
-  1번만 시도되어 stochastic 실패에 약함. 3이면 무진전 가드가 잡지 못하는
-  "느리게 수렴 중" 케이스를 한 번 더 cover. 실제 추가 비용은 거의 없음.
-- **CI/대규모 자동화 시나리오**에서 1-2번의 retry는 거의 표준입니다.
+  집합으로 끝나면 즉시 break. 즉 "어차피 안 풀릴 것"은 pass 4를 소비하지
+  않고, "계속 풀리는 중인 것"에만 추가 기회를 줍니다. 그래서 4가 3보다
+  크게 더 비싸지 않습니다.
+- **3 vs 4의 trade-off도 비대칭**: 4면 무진전 가드가 잡지 못하는
+  "느리게 수렴 중" 케이스를 한 번 더 cover하고 stochastic flake retry 여유가
+  생김. 정확도-우선 default라 깊은 chain이 더 안전하게 풀림.
+- **CI/대규모 자동화 시나리오**에서 1-3번의 retry는 거의 표준입니다.
 
-언제 `4+`로 올릴 만한가:
-- 의존 체인이 4단계 이상 깊고 각 단계에 stochastic 실패가 자주 발생
+언제 `5+`로 올릴 만한가:
+- 의존 체인이 5단계 이상 깊고 각 단계에 stochastic 실패가 자주 발생
 - 외부 service 부팅이 매우 느려서 task별 대기-재시도가 필요
 
-언제 `2`로 내릴 만한가:
+언제 `2-3`으로 내릴 만한가:
 - task 단위가 매우 단순하고 stochastic 실패가 드물어 budget 절약이 명확히
   유리한 경우 (대부분의 프로젝트는 해당 안 됨)
 
@@ -197,16 +199,23 @@ fullauto init
 
 ```json
 {
-  "maxPasses": 3,
-  "subagentTimeoutSec": 1800,
-  "useVerifyLoop": true,
   "gates": [
     { "name": "typecheck", "command": "npm run typecheck --if-present", "skipIf": "test ! -f package.json" },
-    { "name": "test",      "command": "npm test --if-present -- --passWithNoTests", "skipIf": "test ! -f package.json" },
+    { "name": "test",      "command": "npm test --if-present", "skipIf": "test ! -f package.json" },
     { "name": "lint",      "command": "npm run lint --if-present", "skipIf": "test ! -f package.json" }
   ]
 }
 ```
+
+> 위 config은 정확도-우선 default(`maxPasses=4`, `subagentTimeoutSec=3600`,
+> `useVerifyLoop=true`, `plannerTimeoutSec=900`)를 schema에서 그대로 받습니다.
+> 명시하고 싶으면 추가하면 됨. 정확도 default를 더 보수적으로 가져가고 싶다면
+> 위 키들 중 일부를 config에 박아 override하세요.
+>
+> ⚠️ test 게이트는 의도적으로 `--passWithNoTests`를 제거했습니다. 정확도-우선
+> 원칙상 "테스트 없이 통과"는 정확도 0점 — planner가 페어링한 테스트를
+> 빠뜨려도 fail로 잡혀야 합니다. 빈 프로젝트에서는 `--if-present`가 npm 레벨
+> 에서 게이트를 skip시키므로 onboarding이 깨지지 않습니다.
 
 스택별 예시:
 
@@ -799,8 +808,8 @@ run당 모든 것은 `.fullauto/`에 위치:
 | 모든 task가 의심스럽게 빨리 done | 게이트가 너무 약함 (`--passWithNoTests` 등). 실제 테스트가 돌도록 강화 |
 | `Existing state found — resuming` (원치 않은 동작) | 기존 `.fullauto/state.json` 잔존. `--force`로 폐기 |
 | 자동 추론된 결정이 의도와 다름 | `.fullauto/auto-tasks.md` 하단의 `## Assumptions` 섹션을 확인 — 비자명한 결정이 한 줄씩 기록되어 있음. 마음에 안 들면 파일을 직접 편집한 뒤 `fullauto run .fullauto/auto-tasks.md`로 실행하거나, description을 더 구체적으로 써서 재실행 |
-| 서브에이전트 timeout (기본 30분) | `subagentTimeoutSec`을 config에서 늘리거나 task를 더 잘게 쪼개도록 description 조정 |
-| 같은 task가 deferred만 반복 | 기본 `maxPasses=3`. 로그(`.fullauto/logs/T###-attempt*.log`) 보고 근본 원인 수정 후 `fullauto resume` |
+| 서브에이전트 timeout (기본 60분) | `subagentTimeoutSec`을 config에서 늘리거나 task를 더 잘게 쪼개도록 description 조정. 30→60분으로 default 상향됨 (정확도 우선) |
+| 같은 task가 deferred만 반복 | 기본 `maxPasses=4`. 로그(`.fullauto/logs/T###-attempt*.log`) 보고 근본 원인 수정 후 `fullauto resume`. 4 → 5+ 상향이 도움될 수도 |
 | `claude` 명령 못 찾음 | 서브에이전트가 `subagent_error`로 종료됨. PATH에 `claude` CLI 추가 |
 | `/verify-loop`가 안 돈다는 의심 | `~/.claude/skills/verify-loop/SKILL.md` 존재 확인. 없으면 단순 self-review로 폴백 |
 | Verbose 출력이 너무 시끄러움 | `--verbose` 빼고 task별 로그 파일을 직접 읽기 |

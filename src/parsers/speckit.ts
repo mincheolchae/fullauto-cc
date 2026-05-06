@@ -35,7 +35,12 @@ const TASK_LINE = new RegExp(
 
 const DEPENDS_INLINE =
   /\(\s*depends\s+on\s+([^)]+)\)|\[\s*depends:\s*([^\]]+)\]/i;
-const TASK_REF = /T?\d+/g;
+// Strict task-ref matcher: anchored to word boundaries on BOTH sides so
+// nothing like `step3` inside the dep blob mistakenly produces a `T003`
+// dependency. Only `T###` (any digits, with or without the T prefix) as a
+// standalone token counts. Tokens are extracted by splitting the dep blob
+// on commas/whitespace so `T1, T2 and T3` and `T1 T2 T3` both work.
+const TASK_REF_STRICT = /^T?\d+$/i;
 
 interface ParsedLine {
   id?: string;
@@ -96,7 +101,13 @@ function extractDependencies(rawTitle: string): {
   if (!m) return { cleanTitle: rawTitle, dependencies: [] };
 
   const depBlob = m[1] ?? m[2] ?? '';
-  const deps = depBlob.match(TASK_REF) ?? [];
+  // Split on commas, whitespace, "and" (case-insensitive), and ampersand —
+  // anything that's not part of a task ID. Then accept ONLY tokens whose
+  // entire text is a valid task ref (T### or bare ###). This is stricter
+  // than the previous `/T?\d+/g` global match which would extract `3` from
+  // `step3 finished` and silently produce a dangling `T003` dep.
+  const tokens = depBlob.split(/[\s,&]+|\band\b/i).filter(Boolean);
+  const deps = tokens.filter((t) => TASK_REF_STRICT.test(t));
   // Use the same canonical form as task IDs so deps always resolve.
   const normalized = deps.map(canonicalizeId);
   const cleanTitle = rawTitle.replace(DEPENDS_INLINE, '').trim();

@@ -63,9 +63,16 @@ const COMMON_GATES = [
     skipIf: 'test ! -f package.json',
   },
   {
+    // `--if-present` skips the gate entirely when package.json has no `test`
+    // script (fresh project before a test runner is wired up). Once a test
+    // runner exists, we DO want a "0 tests ran" outcome to fail — that's
+    // the only way the orchestrator catches a planner that dropped its
+    // paired test tasks under length pressure. Previously we passed
+    // `--passWithNoTests` to vitest/jest which silently passed the gate
+    // even when zero tests matched, defeating the whole verification design.
     type: 'shell',
     name: 'test',
-    command: 'npm test --if-present -- --passWithNoTests',
+    command: 'npm test --if-present',
     skipIf: 'test ! -f package.json',
   },
   {
@@ -76,10 +83,12 @@ const COMMON_GATES = [
   },
 ];
 
+// Lean config: omit fields that match RunConfig schema defaults so the
+// schema stays the single source of truth for `maxPasses`,
+// `subagentTimeoutSec`, `useVerifyLoop`, etc. Adjusting those defaults in
+// types.ts now propagates to every preset on next `fullauto init` instead
+// of needing N preset edits in lockstep.
 const BASE_CONFIG_SHELL_ONLY: Record<string, unknown> = {
-  maxPasses: 3,
-  subagentTimeoutSec: 1800,
-  useVerifyLoop: true,
   services: [],
   gates: COMMON_GATES,
 };
@@ -128,9 +137,6 @@ const CONVEX: BackendPreset = {
     },
   ],
   buildConfig: () => ({
-    maxPasses: 3,
-    subagentTimeoutSec: 1800,
-    useVerifyLoop: true,
     mcpConfigPath: '.fullauto/mcp.json',
     services: [
       {
@@ -205,9 +211,6 @@ const SUPABASE: BackendPreset = {
     },
   ],
   buildConfig: () => ({
-    maxPasses: 3,
-    subagentTimeoutSec: 1800,
-    useVerifyLoop: true,
     mcpConfigPath: '.fullauto/mcp.json',
     services: [
       {
@@ -309,9 +312,6 @@ const FIREBASE: BackendPreset = {
     },
   ],
   buildConfig: () => ({
-    maxPasses: 3,
-    subagentTimeoutSec: 1800,
-    useVerifyLoop: true,
     services: [
       {
         name: 'firebase-emulators',
@@ -377,16 +377,17 @@ const REST: BackendPreset = {
     },
   ],
   buildConfig: () => ({
-    maxPasses: 3,
-    subagentTimeoutSec: 1800,
-    useVerifyLoop: true,
     services: [
       {
         name: 'backend',
         command: 'npm run dev',
         // EDIT this readyProbe to your actual health endpoint.
         readyProbe: 'curl -fs ${API_BASE_URL:-http://localhost:3000}/health -o /dev/null',
-        readyTimeoutSec: 60,
+        // 120s — Next.js dev first compile, Nest/NestJS bootstrap, Spring,
+        // Rails dev all routinely take 30–90s on first run. Bumped from 60
+        // for accuracy: a service-startup timeout aborts the entire run, so
+        // the cost of "too short" is much higher than "too long".
+        readyTimeoutSec: 120,
         envFiles: ['.env.local', '.env'],
       },
     ],

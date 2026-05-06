@@ -357,7 +357,30 @@ function buildEnhanceTask(
   const titleLabel = feature
     ? `feature "${feature}"`
     : 'all completed user tasks';
-  const bodyLines = groupTasks.map((t) => `- ${t.id}: ${t.title}`);
+  // Include the FULL body (acceptance criteria, file paths, sub-bullets) of
+  // each user task — title alone gives the researcher subagent only a
+  // surface view of what was just shipped, weakening both the convention
+  // axis ("are the table-stakes features in place?") and the trend axis
+  // ("does the implementation match current best practice?"). Cap each
+  // task body at ~800 chars so a verbose group doesn't blow up the
+  // researcher's prompt context: that's enough for typical acceptance-
+  // criteria sub-bullets but not for full RFCs that occasionally land in
+  // task bodies. The cap is per-task, not aggregate, so a 20-task group
+  // still surfaces every task's gist.
+  const PER_TASK_BODY_CAP = 800;
+  const bodyLines = groupTasks.map((t) => {
+    const head = `- ${t.id}: ${t.title}`;
+    if (!t.body || t.body.trim() === t.title.trim()) return head;
+    const body = t.body.length > PER_TASK_BODY_CAP
+      ? `${t.body.slice(0, PER_TASK_BODY_CAP)}…(truncated)`
+      : t.body;
+    // Indent body so it visually nests under the bullet.
+    const indented = body
+      .split('\n')
+      .map((line) => `  ${line}`)
+      .join('\n');
+    return `${head}\n${indented}`;
+  });
   // Match the queue's pass-aware status filter: pass 1 looks for 'pending',
   // pass >= 2 looks for 'deferred'. If we set status='pending' while
   // currentPass=2, queue.next() never picks it and end-of-pass promotion
@@ -450,13 +473,41 @@ async function processOneTask(
   }
 
   const failed = firstFailedGate(gates)!;
+  // Carry the failed gate's output (already capped at GATE_OUTPUT_TAIL_BYTES
+  // upstream) into deferDetail so the next-pass implementer's prompt actually
+  // shows what failed — not just "see log for output". Wrap in a fenced code
+  // block to neutralize stray markdown / sentinel lines (e.g. `# === STDOUT ===`)
+  // inside the captured output. See claude.ts buildSubagentPrompt
+  // priorAttemptBlock for where this gets re-injected.
+  const fencedOutput = wrapAsFencedCodeBlock(failed.output);
   deferTask(
     task,
     attempt,
     'gate_failed',
-    `Gate "${failed.name}" failed (exit ${failed.exitCode}). See log for output.`
+    `Gate "${failed.name}" failed (exit ${failed.exitCode}). Captured output below — read this BEFORE re-implementing so you can target the actual failure rather than guess.\n\n${fencedOutput}`
   );
-  printTaskDeferred(task, attempt.deferDetail!, gates);
+  printTaskDeferred(task, `Gate "${failed.name}" failed (exit ${failed.exitCode})`, gates);
+}
+
+/**
+ * Wrap a string in a fenced code block, picking a fence length longer than
+ * any backtick run inside the content. Without this, an inner ``` would
+ * close our fence prematurely and the surrounding markdown would get
+ * confused. Also strips any trailing-whitespace runs on the closing fence
+ * line so it sits cleanly against the next paragraph.
+ */
+function wrapAsFencedCodeBlock(content: string): string {
+  // Find the longest run of backticks in the content; our fence needs to be
+  // strictly longer. Default to 3 if no backticks present.
+  let maxBacktickRun = 0;
+  const re = /`+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    if (m[0].length > maxBacktickRun) maxBacktickRun = m[0].length;
+  }
+  const fenceLen = Math.max(3, maxBacktickRun + 1);
+  const fence = '`'.repeat(fenceLen);
+  return `${fence}\n${content.replace(/\s+$/, '')}\n${fence}`;
 }
 
 function deferTask(

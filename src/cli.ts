@@ -378,6 +378,27 @@ async function startFreshRun(args: {
   const { projectDir, tasksPath, verbose, autoMode } = args;
   const tasks = await loadTasksFromFile(tasksPath);
 
+  // Validate the parsed task list BEFORE the orchestrator inherits it.
+  // This catches dangling deps / cycles / duplicate IDs in hand-written
+  // tasks.md and speckit output too — `runPlanFlow` already validates
+  // its own planner output, but `fullauto run <file>` came in here
+  // direct without going through that path. Without this, queue.ts:131's
+  // "unknown deps treated as satisfied" fallback and orchestrator.ts:60-65's
+  // cycle-warn-and-proceed silently let the bad plan execute.
+  const validation = validatePlanShape(tasks);
+  if (!validation.ok) {
+    printError(
+      `Tasks file failed validation (${validation.errors.length} error(s)):`
+    );
+    for (const e of validation.errors) console.error(`    • ${e}`);
+    console.error(
+      `  Tasks file: ${tasksPath}\n  Edit it to resolve the issues, then re-run.`
+    );
+    process.exitCode = 2;
+    return false;
+  }
+  for (const w of validation.warnings) printWarn(w);
+
   const userConfig = (await loadUserConfig(projectDir)) ?? {};
   const config = RunConfig.parse(userConfig);
   // CLI flag forces vibeEnhance on for this run. We deliberately don't

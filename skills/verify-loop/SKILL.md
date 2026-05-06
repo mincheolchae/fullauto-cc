@@ -87,7 +87,7 @@ Skip for clearly mechanical work (rename, single-file fix, translated string). O
    - **The user's natural-language request** from the conversation if invoked manually. Quote the actual ask, not your paraphrase of it.
    - **Inferred-from-code-only** as last resort. If you genuinely have no source-of-truth ask (e.g. "fix this bug" with no further detail), write `No explicit requirements — Requirements reviewer will be skipped this cycle.` and skip the Requirements reviewer in Phase D. **Do not invent acceptance criteria** — a fabricated spec causes false BLOCKs.
 
-   **If a `## Prior attempt context` section exists in your subagent prompt** (fullauto re-run of a previously deferred task), the `unmet: ...` field in that block is the highest-priority requirement bullet for this pass. Quote it explicitly at the top of your `## Requirements` block under a `### Carried over from prior pass` sub-heading so the Requirements reviewer makes it the first thing it checks. This is how cross-pass propagation actually works end-to-end: cycle-3-of-pass-N emits structured DEFER → orchestrator stores it → buildSubagentPrompt re-injects it next pass → you (the new implementer) elevate it back into the requirements statement → Requirements reviewer prioritizes it.
+   **If a `## Prior attempt context` section exists in your subagent prompt** (fullauto re-run of a previously deferred task), every `unmet: ...` line in that block is a highest-priority requirement bullet for this pass. Quote ALL of them (not just the first) at the top of your `## Requirements` block under a `### Carried over from prior pass` sub-heading, in the same order they appear, so the Requirements reviewer makes them the first things it checks. Multiple `unmet:` lines mean prior cycle-3 had multiple unresolved BLOCKs — losing any of them means the next pass's Requirements reviewer rediscovers it from scratch (or worse, doesn't). Likewise, every `warn: ...` line in the block flags a meaningful concern the prior cycle judged non-fatal but worth surfacing — quote them under a `### Carried-over WARN signals` sub-heading inside the same `## Requirements` block (or as INFO-level intent statements) so the Correctness/Security reviewers see them as already-flagged when they re-evaluate. This is how cross-pass propagation actually works end-to-end: cycle-3-of-pass-N emits one structured DEFER with one or more `unmet:` / `warn:` lines → orchestrator stores it → buildSubagentPrompt re-injects it next pass → you (the new implementer) elevate every line back into the requirements / intent statements → reviewers prioritize them in the listed order.
 
    Format:
 
@@ -200,10 +200,14 @@ If any BLOCK findings exist:
   - **Inside a `fullauto` subagent** (or any orchestrator that owns the upstream task): the subagent must emit a single DEFER marker with a structured hint so the next pass starts with the gap surfaced rather than rediscovering it from scratch. Format:
 
     ```
-    FULLAUTO_RESULT: DEFER <one-line cause> | unmet: <verbatim requirement bullet OR file:line of the BLOCK> | last-attempt: <one-line summary of the cycle-N fix that didn't take>
+    FULLAUTO_RESULT: DEFER <one-line cause> | unmet: <verbatim requirement bullet OR file:line of the BLOCK> | unmet: <next gap if any> | unmet: <next gap if any> | warn: <unfixed WARN of meaningful concern> | warn: <next WARN if any> | last-attempt: <one-line summary of the cycle-N fix that didn't take>
     ```
 
-    The `unmet:` field is the most important — it lets the next pass's task subagent see "this exact requirement bullet is the open gap" before re-reading the task body, which prevents the same BLOCK from re-surfacing through naive re-implementation. If multiple BLOCKs remain, list the top-priority one as `unmet:` and append `| also-unmet: <count>` so the count propagates without bloating the marker. fullauto's marker parser handles the `|`-delimited fields; legacy `DEFER <reason>` (no `unmet:`) is still accepted but loses propagation benefit. This is the "feedback to the side that gave the work" path the user asked for — the implementer side cannot fix it, so it's bounced back upstream cleanly rather than silently passing.
+    The `unmet:` field is the most important — it lets the next pass's task subagent see exactly which requirement bullets are still open gaps before re-reading the task body, which prevents the same BLOCKs from re-surfacing through naive re-implementation. **If multiple BLOCKs remain, emit one `unmet:` field per BLOCK** in priority order, all in the same DEFER line. The next-pass implementer's `Carried over from prior pass` section will quote every one.
+
+    **Also emit `warn:` fields for any meaningful unfixed WARN** — `warn:` items are non-fatal in the current cycle (loop didn't auto-fix them per Phase E) but in fullauto headless mode the user never sees the final report mid-run, so without explicit propagation those concerns die silently. Skip pure-cosmetic WARNs; include WARNs that flag real edge cases, missing-but-low-priority error handling, security smells one rung below BLOCK, or design concerns the next implementer might want to weigh while picking up the task. Cap at 5 `warn:` lines to keep the marker readable; if you have more than that, the implementer's mental model needs a different intervention than carry-over.
+
+    (Legacy single-`unmet:` markers and bare `DEFER <reason>` still parse, but they lose the multi-gap propagation benefit — older runs that emitted `also-unmet: <count>` count as legacy.) fullauto's marker parser carries the entire defer line verbatim into next pass via deferDetail, so any `|`-delimited field structure rides through unchanged. This is the "feedback to the side that gave the work" path the user asked for — the implementer side cannot fix it, so it's bounced back upstream cleanly rather than silently passing.
   - In both cases, prior BLOCKs are listed in the final report with their last-cycle fix attempt summarized so the receiving side has full context.
 
 ## Phase G — Final Report
@@ -232,10 +236,10 @@ When BLOCKs are clear (or after iteration cap), report once:
 If invoked inside a `fullauto` subagent and BLOCKs remain after iteration cap, additionally emit the structured DEFER marker (Phase F format):
 
 ```
-FULLAUTO_RESULT: DEFER <cause> | unmet: <requirement bullet or file:line> | last-attempt: <cycle-N fix summary>
+FULLAUTO_RESULT: DEFER <cause> | unmet: <requirement bullet or file:line> | unmet: <next gap if any> | warn: <unfixed WARN of meaningful concern> | last-attempt: <cycle-N fix summary>
 ```
 
-so the orchestrator can re-route on the next pass with the gap pre-surfaced. Do NOT emit a bare `DEFER <reason>` if you have a structured hint available — propagation matters.
+Emit one `unmet:` per remaining BLOCK in priority order — all of them, not just the top one — so the next pass starts with the full open-gap list. Also emit `warn:` lines (cap 5) for unfixed WARNs that the next implementer should weigh while re-attempting; pure cosmetic WARNs can be skipped. Do NOT emit a bare `DEFER <reason>` if you have structured hints available — propagation matters.
 
 Do not reopen the loop on user-deferred WARN/INFO — those are decisions, not bugs.
 
