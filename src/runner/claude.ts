@@ -122,6 +122,27 @@ export function buildSubagentPrompt(
       ]
     : [];
 
+  // If this task was attempted in a prior pass and deferred, surface the last
+  // attempt's defer detail so the new subagent starts with the gap pre-known
+  // rather than re-discovering it from scratch. /verify-loop's structured
+  // DEFER markers (`unmet: <bullet> | last-attempt: <fix summary>`) ride
+  // through here verbatim, so a missing-requirement BLOCK from cycle 3 of
+  // pass N appears at the top of pass N+1's prompt.
+  const lastAttempt = task.attempts.length
+    ? task.attempts[task.attempts.length - 1]
+    : undefined;
+  const priorAttemptBlock = lastAttempt?.deferDetail
+    ? [
+        ``,
+        `## Prior attempt context (this task was deferred in pass ${lastAttempt.passNumber})`,
+        `The previous attempt did not complete. The defer signal it left for you:`,
+        ``,
+        `  ${lastAttempt.deferDetail}`,
+        ``,
+        `Treat this as a HINT, not a verdict. The current code state may have changed since (other tasks completed, dependencies resolved, env vars supplied). Read the actual files before re-implementing. If the hint cites an unmet requirement bullet (\`unmet: ...\`), that bullet is your highest-priority focus.`,
+      ]
+    : [];
+
   return [
     `# Single-Task Implementation Job`,
     ``,
@@ -134,6 +155,7 @@ export function buildSubagentPrompt(
     ``,
     `### Details`,
     task.body,
+    ...priorAttemptBlock,
     ...placeholderBlock,
     ``,
     `## Rules`,
