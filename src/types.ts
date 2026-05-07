@@ -290,5 +290,17 @@ export const RunState = z.object({
    * so the user knows what to replace before going live.
    */
   placeholderEnvs: z.array(z.string()).default([]),
+  /**
+   * When the user's `/fullauto` invocation actually started. For `auto`
+   * mode this is captured BEFORE planning — so the final report's "total
+   * elapsed" reflects plan + run, not just run. For `run` mode (no plan
+   * stage) this equals `startedAt`. Optional for back-compat with state
+   * files written before this field existed.
+   */
+  commandStartedAt: z.string().optional(),
+  /** ISO time the planner subagent started (auto mode only). */
+  planStartedAt: z.string().optional(),
+  /** ISO time the planner subagent finished (auto mode only). */
+  planFinishedAt: z.string().optional(),
 });
 export type RunState = z.infer<typeof RunState>;

@@ -374,6 +374,15 @@ async function startFreshRun(args: {
   autoMode?: boolean;
   /** CLI-level override for config.vibeEnhance. When true, force-enable. */
   vibeEnhance?: boolean;
+  /**
+   * Timing fields for the final report. Captured by the caller so `auto`
+   * mode can include the planner stage in the total wall-clock. When
+   * omitted (e.g. `run` mode), the orchestrator's startedAt covers the
+   * full elapsed window.
+   */
+  commandStartedAt?: string;
+  planStartedAt?: string;
+  planFinishedAt?: string;
 }): Promise<boolean> {
   const { projectDir, tasksPath, verbose, autoMode } = args;
   const tasks = await loadTasksFromFile(tasksPath);
@@ -435,13 +444,17 @@ async function startFreshRun(args: {
     if (!proceed) return false;
   }
 
+  const startedAt = new Date().toISOString();
   const state: RunState = {
-    startedAt: new Date().toISOString(),
+    startedAt,
     currentPass: 1,
     tasks,
     config,
     passSnapshots: [],
     placeholderEnvs,
+    commandStartedAt: args.commandStartedAt ?? startedAt,
+    planStartedAt: args.planStartedAt,
+    planFinishedAt: args.planFinishedAt,
   };
   await saveState(projectDir, state);
 
@@ -510,14 +523,14 @@ program
         process.exitCode = 2;
         return;
       }
-      const tasksPath = await runPlanFlow({
+      const planResult = await runPlanFlow({
         projectDir,
         description,
         outputPath,
         timeoutSec: await resolvePlannerTimeoutSec(projectDir, opts.timeout),
       });
-      if (tasksPath) {
-        const prereqs = await loadPrerequisitesFromFile(tasksPath);
+      if (planResult) {
+        const prereqs = await loadPrerequisitesFromFile(planResult.tasksPath);
         printPrerequisites(prereqs);
       }
     }
@@ -552,13 +565,17 @@ async function resolvePlannerTimeoutSec(
  * Returns the path of the planner-written tasks file on success, or null if
  * the planner failed or wrote nothing. Caller decides whether to chain into
  * a run.
+ *
+ * Also returns ISO timestamps marking when the planner subagent started and
+ * finished. Pass these into `startFreshRun` so the final report can show
+ * the plan stage's wall-clock alongside per-task and total durations.
  */
 async function runPlanFlow(args: {
   projectDir: string;
   description: string;
   outputPath: string;
   timeoutSec: number;
-}): Promise<string | null> {
+}): Promise<{ tasksPath: string; planStartedAt: string; planFinishedAt: string } | null> {
   const { projectDir, description, outputPath, timeoutSec } = args;
   printInfo(
     `Planning: "${description.length > 100 ? description.slice(0, 97) + '...' : description}"`
@@ -576,6 +593,7 @@ async function runPlanFlow(args: {
     if (parsed.success) mcpConfigPath = parsed.data.mcpConfigPath;
   }
 
+  const planStartedAt = new Date().toISOString();
   const result = await runPlanner({
     description,
     projectDir,
@@ -586,6 +604,7 @@ async function runPlanFlow(args: {
     // can see what the subagent is doing without needing --verbose.
     onOutput: (chunk) => process.stderr.write(chunk),
   });
+  const planFinishedAt = new Date().toISOString();
 
   if (result.timedOut) {
     printError(`Planner timed out after ${timeoutSec}s.`);
@@ -638,7 +657,7 @@ async function runPlanFlow(args: {
   for (const w of validation.warnings) printWarn(w);
 
   printInfo(`Wrote tasks file: ${outputPath} (${parsedTasks.length} task(s) validated).`);
-  return outputPath;
+  return { tasksPath: outputPath, planStartedAt, planFinishedAt };
 }
 
 program
@@ -717,21 +736,25 @@ program
       }
       const outputPath = resolve(projectDir, opts.output);
 
-      const tasksPath = await runPlanFlow({
+      const commandStartedAt = new Date().toISOString();
+      const planResult = await runPlanFlow({
         projectDir,
         description,
         outputPath,
         timeoutSec: await resolvePlannerTimeoutSec(projectDir, opts.planTimeout),
       });
-      if (!tasksPath) return; // planner failed — exit codes set inside
+      if (!planResult) return; // planner failed — exit codes set inside
 
       printInfo(`Plan accepted — handing off to orchestrator.`);
       await startFreshRun({
         projectDir,
-        tasksPath,
+        tasksPath: planResult.tasksPath,
         verbose: opts.verbose,
         autoMode: true,
         vibeEnhance: opts.vibeEnhance,
+        commandStartedAt,
+        planStartedAt: planResult.planStartedAt,
+        planFinishedAt: planResult.planFinishedAt,
       });
     }
   );

@@ -80,6 +80,132 @@ export function printServiceLine(serviceName: string, line: string): void {
   );
 }
 
+/**
+ * Format an ISO timestamp as `YYYY-MM-DD HH:mm:ss KST`. The locale is fixed
+ * to `en-CA` because its date format is the ISO-style `YYYY-MM-DD` we want;
+ * `Asia/Seoul` pins the wall-clock to KST regardless of the host's timezone
+ * so a CI runner in UTC and the user's laptop print identical timestamps.
+ */
+function formatKst(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const date = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Seoul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+  const time = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Seoul',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(d);
+  return `${date} ${time} KST`;
+}
+
+/**
+ * Render a millisecond duration as a compact human-readable string. Pass
+ * negative or NaN through as `-` so a missing finishedAt doesn't render as
+ * a misleading huge negative number.
+ */
+function formatDuration(ms: number | undefined): string {
+  if (ms === undefined || Number.isNaN(ms) || ms < 0) return '-';
+  const totalSec = Math.round(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (min < 60) return `${min}m ${sec}s`;
+  const hr = Math.floor(min / 60);
+  const remMin = min % 60;
+  return `${hr}h ${remMin}m ${sec}s`;
+}
+
+/**
+ * Sum the wall-clock spent on every attempt of a task. Includes retried
+ * attempts so the per-task figure reflects how much time the orchestrator
+ * actually invested (not just the last successful run). Skips attempts
+ * missing `finishedAt` (typically the in-flight one at crash time).
+ */
+function taskTotalMs(task: Task): number | undefined {
+  let total = 0;
+  let counted = 0;
+  for (const a of task.attempts) {
+    if (!a.finishedAt) continue;
+    const dt = new Date(a.finishedAt).getTime() - new Date(a.startedAt).getTime();
+    if (Number.isFinite(dt) && dt >= 0) {
+      total += dt;
+      counted += 1;
+    }
+  }
+  return counted === 0 ? undefined : total;
+}
+
+function printTimingReport(state: RunState): void {
+  console.log('');
+  console.log(color('bold', '=== Timing (KST) ==='));
+
+  // Total wall-clock: command-issued → now. Falls back to startedAt for
+  // older state files (or `run` mode, where they're equal).
+  const commandStart = state.commandStartedAt ?? state.startedAt;
+  const now = new Date().toISOString();
+  const totalMs =
+    new Date(now).getTime() - new Date(commandStart).getTime();
+  console.log(
+    `  ${color('cyan', 'Command started')}: ${formatKst(commandStart)}`
+  );
+  console.log(`  ${color('cyan', 'Reported at')}    : ${formatKst(now)}`);
+  console.log(
+    `  ${color('cyan', 'Total elapsed')}  : ${color('bold', formatDuration(totalMs))}`
+  );
+
+  // Plan stage (auto mode only — runs the planner subagent before the
+  // orchestrator boots).
+  if (state.planStartedAt && state.planFinishedAt) {
+    const planMs =
+      new Date(state.planFinishedAt).getTime() -
+      new Date(state.planStartedAt).getTime();
+    console.log('');
+    console.log(`  ${color('magenta', 'Plan stage')}`);
+    console.log(`    started : ${formatKst(state.planStartedAt)}`);
+    console.log(`    finished: ${formatKst(state.planFinishedAt)}`);
+    console.log(
+      `    duration: ${color('bold', formatDuration(planMs))}`
+    );
+  }
+
+  // Per-task durations. Skip tasks that never ran (no attempts) — they
+  // wouldn't carry useful timing and would clutter the report.
+  const ranTasks = state.tasks.filter((t) => t.attempts.length > 0);
+  if (ranTasks.length > 0) {
+    console.log('');
+    console.log(`  ${color('magenta', 'Per-task duration')}`);
+    const idWidth = Math.max(...ranTasks.map((t) => t.id.length));
+    for (const t of ranTasks) {
+      const ms = taskTotalMs(t);
+      const dur = formatDuration(ms);
+      const attemptTag =
+        t.attempts.length > 1 ? ` ${color('dim', `(${t.attempts.length} attempts)`)}` : '';
+      const statusColor: keyof typeof c =
+        t.status === 'done'
+          ? 'green'
+          : t.status === 'failed'
+          ? 'red'
+          : t.status === 'deferred'
+          ? 'yellow'
+          : 'dim';
+      const status = color(statusColor, t.status.padEnd(8));
+      const id = t.id.padEnd(idWidth);
+      const title =
+        t.title.length > 60 ? `${t.title.slice(0, 57)}...` : t.title;
+      console.log(
+        `    ${color('cyan', id)}  ${status}  ${dur.padStart(10)}  ${color('dim', title)}${attemptTag}`
+      );
+    }
+  }
+}
+
 export function printFinalReport(state: RunState): void {
   console.log('');
   console.log(color('bold', '=== Final Report ==='));
@@ -115,6 +241,7 @@ export function printFinalReport(state: RunState): void {
   }
 
   printPlaceholderEnvs(state.placeholderEnvs ?? []);
+  printTimingReport(state);
 }
 
 /**
