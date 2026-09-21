@@ -489,6 +489,37 @@ export async function resolvePlannerTimeoutSec(
   return RunConfig.parse({}).plannerTimeoutSec;
 }
 
+/**
+ * Floor under the derived `evolveStageTimeoutSec` default, regardless of how
+ * small `plannerTimeoutSec` is configured — see the field's doc comment in
+ * types.ts for why shape/assess need more room than the plain planner.
+ */
+export const EVOLVE_STAGE_TIMEOUT_FLOOR_SEC = 1800;
+
+/**
+ * Resolve the timeout for evolve's shape and assess stages: explicit
+ * `config.evolveStageTimeoutSec` when set, else derived from the
+ * already-resolved planner timeout as `max(plannerTimeoutSec * 2,
+ * EVOLVE_STAGE_TIMEOUT_FLOOR_SEC)`. Kept as a plain function over
+ * `plannerTimeoutSec` (not re-reading config.json's `plannerTimeoutSec`
+ * itself) so callers that already resolved it (e.g. `runEvolve`, which also
+ * needs it for the CLI-flag precedence `resolvePlannerTimeoutSec` applies)
+ * do not pay for a second file read just to recompute the same value.
+ */
+export async function resolveEvolveStageTimeoutSec(
+  projectDir: string,
+  plannerTimeoutSec: number
+): Promise<number> {
+  const raw = await loadUserConfig(projectDir);
+  if (raw) {
+    const parsed = RunConfig.safeParse(raw);
+    if (parsed.success && parsed.data.evolveStageTimeoutSec !== undefined) {
+      return parsed.data.evolveStageTimeoutSec;
+    }
+  }
+  return Math.max(plannerTimeoutSec * 2, EVOLVE_STAGE_TIMEOUT_FLOOR_SEC);
+}
+
 /** `config.mcpConfigPath` from the user config, when the file parses. */
 export async function resolveMcpConfigPath(projectDir: string): Promise<string | undefined> {
   const userConfigRaw = await loadUserConfig(projectDir);

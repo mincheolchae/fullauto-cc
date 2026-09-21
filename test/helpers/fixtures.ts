@@ -16,6 +16,8 @@ export function makeTask(
     attempts: TaskAttempt[];
     feature: string | undefined;
     kind: 'user' | 'enhance';
+    /** `fullauto retry`'s baseline-reset boundary (src/run-flow.ts requeueFailedTasks). */
+    baselineResetAtAttempt: number;
   }> = {}
 ): Task {
   return Task.parse({
@@ -27,6 +29,7 @@ export function makeTask(
     attempts: overrides.attempts ?? [],
     feature: overrides.feature,
     kind: overrides.kind ?? 'user',
+    baselineResetAtAttempt: overrides.baselineResetAtAttempt,
   });
 }
 

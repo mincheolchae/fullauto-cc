@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { diffSnapshots } from '../../src/audit/diff.js';
 import { takeBaseSnapshot, takeSnapshot } from '../../src/audit/snapshot.js';
 import { makeRepo, type TempRepo } from './_helpers.js';
+import { makeGitCallCounter } from '../helpers/tmp.js';
 
 const repos: TempRepo[] = [];
 afterEach(() => {
@@ -126,5 +127,116 @@ describe('diffSnapshots', () => {
     const f = byPath(await diffSnapshots(base, after, repo.dir));
     expect(f['src/a.ts']).toMatchObject({ kind: 'modified', before: 'a1\n', after: 'a2\n' });
     expect(f['src/b.ts']).toMatchObject({ kind: 'added' });
+  });
+});
+
+/**
+ * Perf finding (fullauto-cc runtime-efficiency review): `readBefore`'s
+ * fallback for a path not captured in `before.contents` (a clean-at-HEAD
+ * file the task then modified — routine for a task that edits pre-existing
+ * files, not just adds new ones) spawned one `git show <sha>:<path>`
+ * PROCESS per file. A task touching hundreds of pre-existing files paid
+ * full process-start cost (~7ms measured) that many times over, sequentially,
+ * inside the diff loop. `showAtBatch` fetches every such path's pre-task
+ * text in ONE `git cat-file --batch` process instead (measured ~19x faster
+ * for 50 paths: ~350ms of separate `git show` spawns vs ~18ms batched).
+ */
+describe('diffSnapshots batches pre-task text lookups into one git process', () => {
+  const N = 40;
+
+  function repoWithNCleanFiles(): TempRepo {
+    const files: Record<string, string> = {};
+    for (let i = 0; i < N; i++) files[`src/f${i}.ts`] = `export const v = ${i};\n`;
+    return makeRepo(files);
+  }
+
+  it('produces the same before/after text as the (formerly) one-spawn-per-file path', async () => {
+    const repo = repoWithNCleanFiles();
+    repos.push(repo);
+    const before = await takeSnapshot(repo.dir); // nothing dirty: none of the N files is in before.contents
+    for (let i = 0; i < N; i++) repo.write(`src/f${i}.ts`, `export const v = ${i + 1000};\n`);
+    const after = await takeSnapshot(repo.dir);
+
+    const diff = await diffSnapshots(before, after, repo.dir);
+    const f = byPath(diff);
+    expect(Object.keys(f)).toHaveLength(N);
+    for (let i = 0; i < N; i++) {
+      expect(f[`src/f${i}.ts`]).toMatchObject({
+        kind: 'modified',
+        before: `export const v = ${i};\n`,
+        after: `export const v = ${i + 1000};\n`,
+      });
+    }
+  });
+
+  it('spawns exactly one `cat-file` process for N changed pre-existing files, not N `show` processes', async () => {
+    const repo = repoWithNCleanFiles();
+    repos.push(repo);
+    const before = await takeSnapshot(repo.dir);
+    for (let i = 0; i < N; i++) repo.write(`src/f${i}.ts`, `export const v = ${i + 1000};\n`);
+    const after = await takeSnapshot(repo.dir);
+
+    const counter = await makeGitCallCounter();
+    const originalPath = process.env.PATH;
+    try {
+      process.env.PATH = `${counter.pathPrefix}:${originalPath ?? ''}`;
+      await diffSnapshots(before, after, repo.dir);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+    expect(await counter.callsFor('show')).toEqual([]);
+    expect((await counter.callsFor('cat-file')).length).toBe(1);
+    await counter.cleanup();
+  });
+
+  it('is measurably faster than the naive one-`git show`-per-file baseline for the same N paths', async () => {
+    const repo = repoWithNCleanFiles();
+    repos.push(repo);
+    const headSha = repo.git('rev-parse', 'HEAD').trim();
+    const paths = Array.from({ length: N }, (_, i) => `src/f${i}.ts`);
+
+    const t0 = performance.now();
+    for (const p of paths) repo.git('show', `${headSha}:./${p}`);
+    const naiveMs = performance.now() - t0;
+
+    const { showAtBatch } = await import('../../src/audit/git.js');
+    const t1 = performance.now();
+    const batched = await showAtBatch(repo.dir, headSha, paths);
+    const batchedMs = performance.now() - t1;
+
+    expect(batched.size).toBe(N);
+    // Generous margin (this only needs to prove the fix, not pin an exact
+    // ratio): eliminating N-1 process spawns should easily halve the time.
+    expect(batchedMs).toBeLessThan(naiveMs / 2);
+  });
+});
+
+describe('showAtBatch (src/audit/git.ts)', () => {
+  it('returns content for existing paths and omits missing ones, matching git show byte-for-byte', async () => {
+    const repo = makeRepo({ 'a.ts': 'export const a = 1;\n', 'b.ts': 'line one\nline two (한글 테스트)\n' });
+    repos.push(repo);
+    const headSha = repo.git('rev-parse', 'HEAD').trim();
+    const { showAtBatch } = await import('../../src/audit/git.js');
+    const out = await showAtBatch(repo.dir, headSha, ['a.ts', 'b.ts', 'does-not-exist.ts']);
+    expect(out.get('a.ts')).toBe('export const a = 1;\n');
+    expect(out.get('b.ts')).toBe('line one\nline two (한글 테스트)\n');
+    expect(out.has('does-not-exist.ts')).toBe(false);
+  });
+
+  it('is empty for an empty path list (no git process needed)', async () => {
+    const repo = makeRepo({ 'a.ts': 'x\n' });
+    repos.push(repo);
+    const { showAtBatch } = await import('../../src/audit/git.js');
+    const counter = await makeGitCallCounter();
+    const originalPath = process.env.PATH;
+    try {
+      process.env.PATH = `${counter.pathPrefix}:${originalPath ?? ''}`;
+      const out = await showAtBatch(repo.dir, 'HEAD', []);
+      expect(out.size).toBe(0);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+    expect(await counter.calls()).toEqual([]);
+    await counter.cleanup();
   });
 });

@@ -7,12 +7,15 @@
  *  - in `before.dirty` but not `after.dirty`    → deleted, or reverted / committed (check disk)
  *  - HEAD moved                                 → also fold in `git diff --name-status before..after`
  *
- * `before` text: `before.contents` when captured, else `git show <before.headSha>:path`.
+ * `before` text: `before.contents` when captured, else `git show <before.headSha>:path`
+ * — fetched for every candidate path in ONE `git cat-file --batch` call
+ * up front (`prefetchBeforeText`) rather than one `git show` spawn per file
+ * as each is classified below; see `showAtBatch` in `./git.ts`.
  * `after` text: the file on disk.
  */
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { git, showAt } from './git.js';
+import { git, showAtBatch } from './git.js';
 import { isCodeFile, isGateConfigFile, isGeneratedPath, isTestFile } from './patterns.js';
 import { DELETED_HASH, sha1File } from './snapshot.js';
 import type { ChangedFile, ChangeKind, TreeSnapshot, TaskDiff } from './types.js';
@@ -38,12 +41,35 @@ async function exists(projectDir: string, path: string): Promise<boolean> {
   }
 }
 
-async function readBefore(before: TreeSnapshot, projectDir: string, path: string): Promise<string | undefined> {
+/**
+ * Every path `readBefore` could plausibly need `before.headSha` content
+ * for, across all three passes below: superset is fine (a path that turns
+ * out to be `added`, or whose text was already in `before.contents`, is
+ * just a few extra bytes read inside the one batched process instead of a
+ * whole spawn saved). `committed` is `committedChanges`'s own output when
+ * HEAD moved, threaded through so section 3 doesn't ask git the same
+ * question (`fromSha..toSha`) twice.
+ */
+async function prefetchBeforeText(
+  before: TreeSnapshot,
+  after: TreeSnapshot,
+  projectDir: string,
+  committed: Array<{ kind: ChangeKind; path: string }>
+): Promise<Map<string, string>> {
+  if (!before.headSha) return new Map();
+  const candidates = new Set<string>();
+  for (const p of after.dirty.keys()) if (!before.contents.has(p)) candidates.add(p);
+  for (const p of before.dirty.keys()) if (!before.contents.has(p)) candidates.add(p);
+  for (const c of committed) if (!before.contents.has(c.path)) candidates.add(c.path);
+  if (candidates.size === 0) return new Map();
+  return showAtBatch(projectDir, before.headSha, [...candidates]);
+}
+
+function readBefore(before: TreeSnapshot, prefetched: Map<string, string>, path: string): string | undefined {
   const captured = before.contents.get(path);
   if (captured !== undefined) return captured;
-  if (!before.headSha) return undefined;
-  const text = await showAt(projectDir, before.headSha, path);
-  return text === '' ? undefined : text;
+  const text = prefetched.get(path);
+  return text === undefined || text === '' ? undefined : text;
 }
 
 function isUntracked(status: string | undefined): boolean {
@@ -67,6 +93,16 @@ export async function diffSnapshots(before: TreeSnapshot, after: TreeSnapshot, p
   const files: ChangedFile[] = [];
   const seen = new Set<string>();
 
+  // Computed once up front (section 3 below needs it to fold in committed
+  // changes; the prefetch needs its paths too) instead of only when section
+  // 3 runs, so both can share the one `git diff --name-status` spawn.
+  const committed = headMoved && after.headSha ? await committedChanges(projectDir, before.headSha, after.headSha) : [];
+  // One `git cat-file --batch` for every path that might need `before`
+  // text from HEAD, instead of a `git show` spawned per file as each is
+  // classified below (see `prefetchBeforeText` / `showAtBatch`).
+  const prefetched = await prefetchBeforeText(before, after, projectDir, committed);
+  const readBeforeText = (path: string) => readBefore(before, prefetched, path);
+
   const push = (f: ChangedFile) => {
     if (seen.has(f.path)) return;
     seen.add(f.path);
@@ -83,11 +119,11 @@ export async function diffSnapshots(before: TreeSnapshot, after: TreeSnapshot, p
 
     if (!fpBefore) {
       if (gone) {
-        push(classify(path, 'deleted', await readBefore(before, projectDir, path), undefined));
+        push(classify(path, 'deleted', readBeforeText(path), undefined));
       } else if (isUntracked(fpAfter.status) || fpAfter.status?.[0] === 'A') {
         push(classify(path, 'added', undefined, await readAfter(projectDir, path)));
       } else {
-        push(classify(path, 'modified', await readBefore(before, projectDir, path), await readAfter(projectDir, path)));
+        push(classify(path, 'modified', readBeforeText(path), await readAfter(projectDir, path)));
       }
       continue;
     }
@@ -95,11 +131,11 @@ export async function diffSnapshots(before: TreeSnapshot, after: TreeSnapshot, p
     if (fpBefore.hash === fpAfter.hash) continue; // unchanged dirty file
 
     if (gone) {
-      push(classify(path, 'deleted', await readBefore(before, projectDir, path), undefined));
+      push(classify(path, 'deleted', readBeforeText(path), undefined));
     } else if (fpBefore.hash === DELETED_HASH) {
       push(classify(path, 'added', undefined, await readAfter(projectDir, path)));
     } else {
-      push(classify(path, 'modified', await readBefore(before, projectDir, path), await readAfter(projectDir, path)));
+      push(classify(path, 'modified', readBeforeText(path), await readAfter(projectDir, path)));
     }
   }
 
@@ -109,7 +145,7 @@ export async function diffSnapshots(before: TreeSnapshot, after: TreeSnapshot, p
     const onDisk = await exists(projectDir, path);
     if (!onDisk) {
       if (fpBefore.hash === DELETED_HASH) continue; // already gone before; nothing new
-      push(classify(path, 'deleted', await readBefore(before, projectDir, path), undefined));
+      push(classify(path, 'deleted', readBeforeText(path), undefined));
       continue;
     }
     // Exists and clean w.r.t. after.headSha: content may still differ from before.
@@ -123,26 +159,23 @@ export async function diffSnapshots(before: TreeSnapshot, after: TreeSnapshot, p
     if (fpBefore.hash === DELETED_HASH) {
       push(classify(path, 'added', undefined, await readAfter(projectDir, path)));
     } else {
-      push(classify(path, 'modified', await readBefore(before, projectDir, path), await readAfter(projectDir, path)));
+      push(classify(path, 'modified', readBeforeText(path), await readAfter(projectDir, path)));
     }
   }
 
   // 3. HEAD moved: fold in committed changes not already covered.
-  if (headMoved && after.headSha) {
-    const entries = await committedChanges(projectDir, before.headSha, after.headSha);
-    for (const { kind, path } of entries) {
-      if (seen.has(path)) continue;
-      if (kind === 'added') {
-        // Was it dirty-untracked before (already existed on disk)? Then it was only committed, not created.
-        const fpBefore = before.dirty.get(path);
-        if (fpBefore && fpBefore.hash !== DELETED_HASH) continue;
-        push(classify(path, 'added', undefined, await readAfter(projectDir, path)));
-      } else if (kind === 'deleted') {
-        if (await exists(projectDir, path)) continue; // re-created in the working tree
-        push(classify(path, 'deleted', await readBefore(before, projectDir, path), undefined));
-      } else {
-        push(classify(path, 'modified', await readBefore(before, projectDir, path), await readAfter(projectDir, path)));
-      }
+  for (const { kind, path } of committed) {
+    if (seen.has(path)) continue;
+    if (kind === 'added') {
+      // Was it dirty-untracked before (already existed on disk)? Then it was only committed, not created.
+      const fpBefore = before.dirty.get(path);
+      if (fpBefore && fpBefore.hash !== DELETED_HASH) continue;
+      push(classify(path, 'added', undefined, await readAfter(projectDir, path)));
+    } else if (kind === 'deleted') {
+      if (await exists(projectDir, path)) continue; // re-created in the working tree
+      push(classify(path, 'deleted', readBeforeText(path), undefined));
+    } else {
+      push(classify(path, 'modified', readBeforeText(path), await readAfter(projectDir, path)));
     }
   }
 

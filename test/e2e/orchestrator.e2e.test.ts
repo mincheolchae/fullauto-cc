@@ -614,4 +614,80 @@ describe('(f) vibe-enhance injection', () => {
     const result = await runFresh([makeTask('T001', { body: 'FAKE: write src/x.ts' })], { maxPasses: 1 });
     expect(result.tasks.map((t) => t.id)).toEqual(['T001']);
   });
+
+  it('enhanceBudget=0: the enhance task completes done with no subagent spawn at all', async () => {
+    const result = await runFresh(
+      [makeTask('T001', { title: 'Create greeting module', body: 'FAKE: write src/greet.ts' })],
+      { maxPasses: 1, vibeEnhance: true, enhanceBudget: 0 }
+    );
+    const enhance = byId(result, 'ENHANCE-all');
+    expect(enhance.status).toBe('done');
+    expect(enhance.attempts).toHaveLength(1);
+    // No subagent was ever spawned for it: no log path, no gate results.
+    expect(enhance.attempts[0].subagentLogPath).toBeUndefined();
+    expect(enhance.attempts[0].gateResults).toEqual([]);
+    expect(enhance.attempts[0].enhance).toEqual({ applied: 0, optional: 0, promote: [] });
+    expect(existsSync(logPathFor(projectDir, 'ENHANCE-all', 1))).toBe(false);
+
+    // Only T001's prompt was ever sent to `claude` — one spawn total for the run.
+    const prompts = await fake.prompts();
+    expect(prompts).toHaveLength(1);
+  });
+
+  it('budget exhausted by an earlier group\'s applied additions: a later group\'s enhance task is skipped without spawning', async () => {
+    // Every vibe-enhance prompt shares the same H1, so this script fires for
+    // any invocation — the point of the test is that it must fire AT MOST
+    // ONCE (for ENHANCE-us1); if the budget check regresses and ENHANCE-us2
+    // is spawned too, it would ALSO report applied=1 and the prompt count /
+    // log-path assertions below would catch it.
+    await fake.script('# vibe-enhance pass', 'FAKE: echo FULLAUTO_ENHANCE: applied=1 optional=0 promote=none');
+    const result = await runFresh(
+      [
+        makeTask('T001', { title: 'Login form', body: 'FAKE: mark T001', feature: 'US1' }),
+        makeTask('T002', { title: 'Profile page', body: 'FAKE: mark T002', feature: 'US2' }),
+      ],
+      { maxPasses: 2, vibeEnhance: true, enhanceBudget: 1 }
+    );
+    expect(result.tasks.map((t) => [t.id, t.status])).toEqual([
+      ['T001', 'done'],
+      ['ENHANCE-us1', 'done'],
+      ['T002', 'done'],
+      ['ENHANCE-us2', 'done'],
+    ]);
+    expect(result.enhanceBudgetRemaining).toBe(0);
+
+    const first = byId(result, 'ENHANCE-us1');
+    expect(first.attempts[0].subagentLogPath).toBeDefined();
+    expect(first.attempts[0].enhance).toEqual({ applied: 1, optional: 0, promote: [] });
+
+    const second = byId(result, 'ENHANCE-us2');
+    expect(second.attempts).toHaveLength(1);
+    expect(second.attempts[0].subagentLogPath).toBeUndefined(); // never spawned
+    expect(second.attempts[0].enhance).toEqual({ applied: 0, optional: 0, promote: [] });
+    expect(existsSync(logPathFor(projectDir, 'ENHANCE-us2', 1))).toBe(false);
+
+    // T001, T002, ENHANCE-us1 — ENHANCE-us2 never reached `claude` at all.
+    const prompts = await fake.prompts();
+    expect(prompts).toHaveLength(3);
+  });
+});
+
+describe('(g) stuck-task detection (identical gate failure)', () => {
+  it('a task whose configured gate fails identically every attempt gets exactly 2 real spawns, then fails — not the full maxPasses worth', async () => {
+    const result = await runFresh(
+      [makeTask('T001', { title: 'Always broken', body: 'FAKE: mark T001' })],
+      { maxPasses: 4, gates: [{ name: 'always-fails', command: 'echo boom && exit 1' }] }
+    );
+    const t1 = byId(result, 'T001');
+    expect(t1.status).toBe('failed');
+    // Only the two attempts that ESTABLISHED the identical-failure streak
+    // actually spawned a subagent; queue.next() stops offering the task
+    // once stuckOnIdenticalGateFailure trips, so a 3rd/4th identical-cost
+    // spawn (up to maxPasses=4) never happens.
+    const realSpawns = t1.attempts.filter((a) => a.subagentLogPath !== undefined);
+    expect(realSpawns).toHaveLength(2);
+    expect(realSpawns.every((a) => a.deferReason === 'gate_failed')).toBe(true);
+    const marks = await fake.marks();
+    expect(marks.filter((m) => m === 'T001')).toHaveLength(2); // the real `claude` binary itself ran exactly twice
+  });
 });

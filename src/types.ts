@@ -513,6 +513,19 @@ export const RunConfig = z.object({
    * the no-progress guard makes the extra pass nearly free when nothing's
    * converging, and gives an extra retry to deeper dep chains that ARE
    * converging slowly.
+   *
+   * That "nearly free" reasoning is whole-run: it does not by itself cover
+   * a single task stuck while every OTHER task keeps converging, since
+   * `noProgressInCurrentPass` only compares the pass-wide unresolved set —
+   * a stuck task would otherwise ride along for a full-cost subagent spawn
+   * every remaining pass. `queue.ts`'s `stuckOnIdenticalGateFailure` covers
+   * exactly that gap: once a task's last two attempts fail the SAME gate
+   * with byte-identical output, `next()` stops offering it a further
+   * attempt (it still ends up `failed` at the same point it otherwise
+   * would have) rather than spending `maxPasses` on an outcome the last
+   * two real attempts already proved will not change. This does not
+   * shrink `maxPasses` itself — it only skips attempts that would be
+   * provably identical in cost and outcome to one already made.
    */
   maxPasses: z.number().int().positive().default(4),
   /**
@@ -535,6 +548,25 @@ export const RunConfig = z.object({
    * `--timeout`) overrides this when set.
    */
   plannerTimeoutSec: z.number().int().positive().default(900),
+  /**
+   * Timeout for `fullauto evolve`'s shape and assess stages, in seconds.
+   * Unset (default) derives from `plannerTimeoutSec`: `max(plannerTimeoutSec
+   * * 2, 1800)` — see `resolveEvolveStageTimeoutSec` in run-flow.ts. These
+   * two stages are NOT plain task-decomposition planning: `/product-shape`
+   * benchmarks peers over WebSearch, and `/product-assess` reads
+   * state.json + tasks.md + the changed code and scores five dimensions
+   * before rewriting product.md — both routinely need more wall-clock than
+   * the plain planner call `plannerTimeoutSec` was tuned for. Discovered
+   * live: an evolve run using the shared `plannerTimeoutSec` timed out the
+   * assess stage on both of its two attempts (real subagent behavior, not
+   * hypothetical — see the `EvolveAbort` message in `assessStage`), which
+   * burns a whole `claude -p` invocation per attempt on a GUARANTEED
+   * timeout — real cost, not just wasted time. The plan stage keeps using
+   * `plannerTimeoutSec` directly; it stays close in shape to the ordinary
+   * planner. Set this explicitly to override the derived default (e.g. a
+   * very large product.md that makes even the derived default too tight).
+   */
+  evolveStageTimeoutSec: z.number().int().positive().optional(),
   /**
    * Whether to instruct the implementer subagent to invoke /verify-loop.
    * Kept for back-compat; `false` is treated as `verifyMode: 'gates-only'`
@@ -634,6 +666,13 @@ export const RunConfig = z.object({
    * `DeferReason: 'rate_limited'`. At the default backoff schedule this is
    * roughly 1.5h of patient waiting before a still-saturated API defers to
    * the next pass, rather than an unattended run hanging forever on one task.
+   * When the CLI's error names an exact reset time (`resetHintSleepMs` in
+   * runner/rate-limit.ts, e.g. "resets 5:50pm (Asia/Seoul)"), a retry sleeps
+   * close to that reset instead of the blind exponential schedule — capped
+   * at 6h so a misparsed clock time cannot turn one retry into most of a
+   * day — which can make an individual wait longer than the ~1.5h figure
+   * above but avoids the many blind, wastefully-spaced retries that figure
+   * otherwise implies for a session hit early in a long reset window.
    */
   rateLimitMaxRetries: z.number().int().nonnegative().default(10),
 });

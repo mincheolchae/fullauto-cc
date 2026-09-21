@@ -330,6 +330,29 @@ function attemptFresh(passNumber: number): TaskAttempt {
   };
 }
 
+/** Rationale line appended when an `enhance` task is finished without a subagent spawn (see `processOneTask`). */
+export const ENHANCE_BUDGET_EXHAUSTED_NOTE =
+  'enhance budget already 0 when this pass started — skipped without spawning a subagent (a budget=0 /vibe-enhance pass would only report OPTIONAL/PROMOTE candidates, never apply anything, so the outcome is already knowable without the cost of a claude -p invocation)';
+
+/**
+ * Complete a `enhance` task as a no-op `done` WITHOUT spawning a subagent,
+ * running gates, or running the audit — the run's vibe-enhance budget was
+ * already exhausted before this task started, so nothing in the tree can
+ * change and there is nothing to verify. Mirrors the shape a normal
+ * budget-respecting enhance attempt leaves (classification, tdd phase,
+ * `attempt.enhance` accounting) so downstream consumers (the reporter,
+ * `evolve.ts`'s round summary) don't need a special case for this path.
+ */
+function finishBudgetExhaustedEnhance(task: Task, attempt: TaskAttempt, state: RunState): void {
+  const cls = classifyTask(task, state.tasks);
+  cls.rationale.push(ENHANCE_BUDGET_EXHAUSTED_NOTE);
+  attempt.classification = cls;
+  attempt.tdd = { phase: cls.tdd };
+  attempt.enhance = { applied: 0, optional: 0, promote: [] };
+  task.status = 'done';
+  attempt.finishedAt = new Date().toISOString();
+}
+
 // ---------- config-file integrity ----------
 
 /** Files the tree-diff audit cannot see (gitignored) but a subagent could edit to change the next spawn / gates. */
@@ -461,6 +484,25 @@ async function processOneTask(
   const attempt: TaskAttempt = attemptFresh(state.currentPass);
   task.attempts.push(attempt);
 
+  // Enhance-budget short-circuit: a `vibeEnhance` run injects an
+  // ENHANCE-<feature> task after EVERY completed feature group regardless
+  // of remaining budget (synthetic-tasks.ts `syntheticKindsFor` only checks
+  // `config.vibeEnhance`) — so once `enhanceBudgetRemaining` hits 0, every
+  // LATER group's enhance pass is a guaranteed no-op. `/vibe-enhance`'s own
+  // `budget=0` mode still grounds itself (product brief, convention / UX
+  // axes) before reporting nothing-applied, which is a full `claude -p`
+  // invocation spent on an outcome already knowable here without asking a
+  // subagent — real, avoidable cost on any run with more than
+  // `enhanceBudget` feature groups. Skip the spawn entirely and record a
+  // `done` task with a clear no-op reason instead; no gates/audit needed
+  // either, since nothing changed in the tree for this task.
+  if (task.kind === 'enhance' && (state.enhanceBudgetRemaining ?? state.config.enhanceBudget) <= 0) {
+    finishBudgetExhaustedEnhance(task, attempt, state);
+    printTaskStart(task, attemptNum, 'enhance · skipped (budget exhausted, no subagent spawned)');
+    printTaskDone(task, [], 0, attempt);
+    return;
+  }
+
   // 0. Classify + pick verification depth. Recomputed every attempt (not
   //    cached on the task) because pairing depends on the OTHER tasks, which
   //    can change between passes (a red task that failed in pass 1 is still
@@ -495,11 +537,35 @@ async function processOneTask(
   // the baseline it persisted before spawning. (With rollback-on-defer the
   // previous attempt's changes are already gone, so the overlay is a no-op
   // there; it is load-bearing when rollback is off or was unavailable.)
-  const priorTouched = await resolvePriorTouched(task, projectDir);
+  // `now`, when set, is the SAME working-tree snapshot `resolvePriorTouched`
+  // just took to rebuild a crashed attempt's touched list — nothing runs
+  // between that call and this one, so re-snapshotting here would just
+  // re-run `git status` and re-hash every dirty file for an identical
+  // result; reuse it instead.
+  const { touched: priorTouched, now: reusableNow } = await resolvePriorTouched(task, projectDir);
+  // The RAW snapshot (before `overlayTouched` rewrites it below) reflects
+  // what is ACTUALLY dirty on disk right now — `before`, after the overlay,
+  // can differ (paths rewound to a pre-task fingerprint, or dropped
+  // entirely) for audit-diffing purposes, which is the wrong list to hand
+  // `captureTree` for its own `dirtyPaths` optimization below.
+  const rawNow = reusableNow ?? (await takeSnapshot(projectDir));
   const originHeadSha = originalHeadSha(task);
-  const before = overlayTouched(await takeSnapshot(projectDir), priorTouched, originHeadSha);
+  const before = overlayTouched(rawNow, priorTouched, originHeadSha);
   // The tree object a deferred attempt is rolled back to (src/rollback.ts).
-  const treeSha = state.config.rollbackOnDefer && before.gitRepo !== false ? await captureTree(projectDir) : null;
+  // `before` was just taken by `takeSnapshot` above, so `gitRepo` / `headSha`
+  // are already known — pass them through so `captureTree` skips its own
+  // `rev-parse` round trips instead of re-asking the same two questions.
+  // (`before.headSha` may be the task's ORIGINAL head, not the literal
+  // current one, when an earlier attempt committed — but that still answers
+  // "does HEAD exist" correctly, which is all `captureTree` needs it for;
+  // it reads the live `HEAD` ref itself, not this sha.) `dirtyPaths` comes
+  // from `rawNow`, not `before`, for the reason above: it must be the
+  // actual current dirty set so `captureTree`'s narrowed `git add` doesn't
+  // miss a path the overlay reinterpreted for diffing purposes.
+  const treeSha =
+    state.config.rollbackOnDefer && before.gitRepo !== false
+      ? await captureTree(projectDir, { insideWorkTree: true, headSha: before.headSha, dirtyPaths: [...rawNow.dirty.keys()] })
+      : null;
   attempt.baseline = { headSha: before.headSha, dirty: [...before.dirty.values()], ...(treeSha ? { treeSha } : {}) };
   const logPath = logPathFor(projectDir, task.id, attemptNum);
   // Stamped BEFORE the pre-spawn save so a crash / signal mid-subagent
@@ -903,6 +969,19 @@ function resolveGreenRedSets(cls: AuditInput['classification'], task: Task, stat
 }
 
 /**
+ * `resolvePriorTouched`'s result. `now`, when present, is the working-tree
+ * snapshot it happened to take while rebuilding a crashed attempt's touched
+ * list — the caller's very next step (`processOneTask`) needs a snapshot of
+ * that SAME, still-unchanged tree for `before`, so it's handed back here
+ * instead of the caller taking a second, redundant `takeSnapshot()` (another
+ * `git status` + a re-hash of every dirty file) immediately after.
+ */
+interface PriorTouchedResult {
+  touched: TouchedFile[];
+  now?: TreeSnapshot;
+}
+
+/**
  * The cumulative touched-file list left by the task's most recent earlier
  * attempt (the in-flight attempt was already pushed and has none). An
  * attempt that CRASHED mid-subagent never got to record one — but it did
@@ -911,7 +990,7 @@ function resolveGreenRedSets(cls: AuditInput['classification'], task: Task, stat
  * the baseline, so `beforeContent` is absent for those entries (the
  * integrity checks then fall back to HEAD for pre-task text).
  */
-async function resolvePriorTouched(task: Task, projectDir: string): Promise<TouchedFile[]> {
+async function resolvePriorTouched(task: Task, projectDir: string): Promise<PriorTouchedResult> {
   // `baselineResetAtAttempt` (set by `fullauto retry` — src/run-flow.ts
   // `requeueFailedTasks`) marks attempts before it as history only: never
   // consult them for what a PRIOR attempt touched, or a retry started fresh
@@ -920,19 +999,19 @@ async function resolvePriorTouched(task: Task, projectDir: string): Promise<Touc
   const floor = task.baselineResetAtAttempt ?? 0;
   for (let i = task.attempts.length - 1; i >= floor; i--) {
     const a = task.attempts[i];
-    if (a.touched) return a.touched;
+    if (a.touched) return { touched: a.touched };
     if (a.baseline && a.finishedAt === undefined && i !== task.attempts.length - 1) {
       const base = snapshotFromBaseline(a.baseline);
       if (base.gitRepo === false) continue;
       // Earlier attempts' lists were folded into this baseline already (it
       // was overlaid when taken), so `prior` for the rebuild is empty.
       const now = await takeSnapshot(projectDir);
-      if (now.gitRepo === false) return [];
+      if (now.gitRepo === false) return { touched: [] };
       const diff = await safeDiff(base, now, projectDir);
-      return touchedFromDiff(diff, base, []);
+      return { touched: touchedFromDiff(diff, base, []), now };
     }
   }
-  return [];
+  return { touched: [] };
 }
 
 /** A TreeSnapshot rebuilt from a persisted attempt baseline (fingerprints only). */

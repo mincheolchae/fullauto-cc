@@ -1,4 +1,68 @@
-import type { RunState, Task, TaskStatus } from './types.js';
+import type { GateResult, RunState, Task, TaskAttempt, TaskStatus } from './types.js';
+
+/**
+ * Parses the `Gate "<name>" failed (exit <code>)` header every `gate_failed`
+ * deferDetail starts with (the ONE call site is orchestrator.ts's
+ * `settleDefer('gate_failed', ...)` in the gate-failure branch of
+ * `processOneTask`).
+ */
+const GATE_FAILURE_HEADER_RE = /^Gate "([^"]+)" failed \(exit (-?\d+)\)/;
+
+/**
+ * The specific gate `evaluateGates` reported as the cause of a `gate_failed`
+ * defer, re-identified from the attempt's own `deferDetail` header rather
+ * than scanning `gateResults` for any `passed: false` entry — more than one
+ * configured gate can fail raw in the same attempt (e.g. typecheck AND
+ * test), and `evaluateGates` reports only the first non-quarantined one;
+ * that is the one whose output actually reached the subagent as the retry
+ * hint, so it is the one worth comparing across attempts.
+ */
+function reportedFailedGate(attempt: TaskAttempt): GateResult | undefined {
+  if (attempt.deferReason !== 'gate_failed' || !attempt.deferDetail) return undefined;
+  const m = GATE_FAILURE_HEADER_RE.exec(attempt.deferDetail);
+  if (!m) return undefined;
+  const [, name, exitCodeStr] = m;
+  return attempt.gateResults.find((g) => g.name === name && g.exitCode === Number(exitCodeStr));
+}
+
+/**
+ * True when the task's two most recent COMPLETED attempts (within the
+ * `baselineResetAtAttempt` window — a `fullauto retry` resets the streak,
+ * since a human intervened between them) both deferred on the exact same
+ * gate failure: same gate name, same exit code, the same captured output
+ * byte-for-byte. Two independent real attempts — the second one given the
+ * first one's failure as prior-attempt context in its own prompt — that
+ * still produce IDENTICAL gate output is strong evidence a further
+ * identical-cost retry will not converge either.
+ *
+ * Why this exists: `maxPasses`'s doc comment (types.ts) reasons that "the
+ * no-progress guard makes the extra pass nearly free when nothing's
+ * converging" — true for a run that is stuck AS A WHOLE, but not for a
+ * single task stuck this way while every OTHER task keeps converging:
+ * `noProgressInCurrentPass` only compares the pass-wide unresolved id SET,
+ * so it never notices one task riding along for a full-cost subagent spawn
+ * every remaining pass up to `maxPasses` on an outcome the last two
+ * attempts already proved will not change. `next()` uses this to stop
+ * offering the task up for another attempt; it stays `deferred` and is
+ * promoted to `failed` by the normal end-of-run "still unresolved" sweep,
+ * same as any task that exhausts `maxPasses` — this only moves that point
+ * earlier once the evidence is unambiguous, and only for the one task.
+ */
+export function stuckOnIdenticalGateFailure(task: Task): boolean {
+  const floor = task.baselineResetAtAttempt ?? 0;
+  const completed = task.attempts.filter((a, i) => i >= floor && a.finishedAt !== undefined);
+  if (completed.length < 2) return false;
+  const last = completed[completed.length - 1];
+  const prev = completed[completed.length - 2];
+  const lastGate = reportedFailedGate(last);
+  const prevGate = reportedFailedGate(prev);
+  if (!lastGate || !prevGate) return false;
+  return (
+    lastGate.name === prevGate.name &&
+    lastGate.exitCode === prevGate.exitCode &&
+    lastGate.output === prevGate.output
+  );
+}
 
 export class TaskQueue {
   constructor(private readonly state: RunState) {}
@@ -34,6 +98,11 @@ export class TaskQueue {
    * `finishedAt`, so the task remains eligible — exactly what we want on
    * resume.
    *
+   * Also excludes a task whose last two attempts failed on the exact same
+   * gate (`stuckOnIdenticalGateFailure`) — see that function's doc comment.
+   * It stays `deferred`, just never offered again; the end-of-run sweep
+   * promotes it to `failed` like any other task that runs out of passes.
+   *
    * Returns undefined when nothing in this pass is currently eligible.
    */
   next(): Task | undefined {
@@ -47,7 +116,8 @@ export class TaskQueue {
         this.dependenciesSatisfied(t) &&
         !t.attempts.some(
           (a) => a.passNumber === currentPass && a.finishedAt !== undefined
-        )
+        ) &&
+        !stuckOnIdenticalGateFailure(t)
     );
   }
 

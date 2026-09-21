@@ -92,28 +92,85 @@ function tmpIndexPath(projectDir: string): string {
 }
 
 /**
+ * Above this many paths, `dirtyPaths` (see `KnownRepoState`) falls back to
+ * the blind `add -A -- .` instead of listing them all as CLI args — well
+ * past any realistic per-task dirty set, just a guard against pathological
+ * resume states and OS argv-length limits.
+ */
+const MAX_SELECTIVE_ADD_PATHS = 4000;
+
+/**
+ * Facts about the repo the caller already established (typically from the
+ * `TreeSnapshot` it just took), so `captureTree` doesn't re-derive them with
+ * its own `rev-parse` round trips — or re-discover the same dirty set with
+ * its own full-tree walk. All optional: pass what you have.
+ */
+export interface KnownRepoState {
+  /** From `TreeSnapshot.gitRepo`. Omit / `undefined` ⇒ `captureTree` checks itself. */
+  insideWorkTree?: boolean;
+  /** From `TreeSnapshot.headSha` (`null` ⇒ unborn branch). Omit ⇒ `captureTree` checks itself. */
+  headSha?: string | null;
+  /**
+   * Exact paths that differ from HEAD (e.g. `[...snapshot.dirty.keys()]`
+   * from a `TreeSnapshot` of the SAME directory, taken with nothing in
+   * between). Every OTHER path is, by construction, identical to what
+   * `read-tree HEAD` just seeded the temp index with, so `git add` only
+   * needs to (re-)stage these — passed as explicit pathspecs instead of
+   * `add -A -- .`, which walks and stat's the ENTIRE working tree to
+   * rediscover a dirty set the caller already has. `add -A` still handles
+   * a path that no longer exists as a removal, so deletions need no special
+   * case. Measured on a 3,000-tracked-file / 200-dirty-file repo: `add -A
+   * -- .` ~150–250ms vs `add -A -- <200 paths>` ~35ms — the walk scales
+   * with repo size, not with how much actually changed. An empty array
+   * (nothing dirty) skips the `add` spawn entirely.
+   */
+  dirtyPaths?: string[];
+}
+
+/**
  * Tree object for the working tree as it is now (tracked + untracked,
  * .gitignore honoured, orchestrator state excluded). Null when the
  * directory is not a git work tree or git failed; never throws.
+ *
+ * `known`: when the caller just took a `TreeSnapshot` of the same
+ * directory (nothing in between could have changed repo-ness, HEAD, or
+ * what's dirty), pass its `gitRepo` / `headSha` / `dirty` here to skip
+ * `captureTree` re-deriving each of them itself — cuts a captureTree call
+ * from 5 git spawns to 3, and (with `dirtyPaths`) makes the remaining `add`
+ * spawn scale with the dirty set instead of the whole repo (see
+ * `src/orchestrator.ts`, which calls this right after `takeSnapshot`).
  */
-export async function captureTree(projectDir: string): Promise<string | null> {
+export async function captureTree(projectDir: string, known?: KnownRepoState): Promise<string | null> {
   const index = tmpIndexPath(projectDir);
   const env = { GIT_INDEX_FILE: index };
   try {
     await mkdir(dirname(index), { recursive: true });
     await rm(index, { force: true });
-    const inside = await gitEnv(projectDir, ['rev-parse', '--is-inside-work-tree']);
-    if (inside.code !== 0 || inside.stdout.trim() !== 'true') return null;
+    let headExists: boolean;
+    if (known?.insideWorkTree !== undefined) {
+      if (!known.insideWorkTree) return null;
+      headExists = known.headSha !== undefined ? known.headSha !== null : (await gitEnv(projectDir, ['rev-parse', '--verify', '-q', 'HEAD'])).code === 0;
+    } else {
+      const inside = await gitEnv(projectDir, ['rev-parse', '--is-inside-work-tree']);
+      if (inside.code !== 0 || inside.stdout.trim() !== 'true') return null;
+      headExists = (await gitEnv(projectDir, ['rev-parse', '--verify', '-q', 'HEAD'])).code === 0;
+    }
     // Seed from HEAD so files outside `projectDir` (a sub-directory run) and
     // unchanged tracked files are in the tree; an unborn branch has no HEAD
     // and the index simply starts empty.
-    const head = await gitEnv(projectDir, ['rev-parse', '--verify', '-q', 'HEAD']);
-    if (head.code === 0) {
+    if (headExists) {
       const rt = await gitEnv(projectDir, ['read-tree', 'HEAD'], env);
       if (rt.code !== 0) return null;
     }
-    const add = await gitEnv(projectDir, ['add', '-A', '--', '.', ...excludePathspecs()], env);
-    if (add.code !== 0) return null;
+    const dirtyPaths = known?.dirtyPaths;
+    const useDirtyPaths = dirtyPaths !== undefined && dirtyPaths.length <= MAX_SELECTIVE_ADD_PATHS;
+    // Nothing dirty (an empty `dirtyPaths`): `read-tree HEAD` alone is
+    // already the right tree — skip the `add` spawn entirely.
+    if (!useDirtyPaths || dirtyPaths!.length > 0) {
+      const targets = useDirtyPaths ? dirtyPaths! : ['.'];
+      const add = await gitEnv(projectDir, ['add', '-A', '--', ...targets, ...excludePathspecs()], env);
+      if (add.code !== 0) return null;
+    }
     const wt = await gitEnv(projectDir, ['write-tree'], env);
     if (wt.code !== 0) return null;
     const sha = wt.stdout.trim();

@@ -24,6 +24,13 @@ describe('RunConfig — new fields and defaults', () => {
     expect(c.audit.testIntegrity).toBe(true);
   });
 
+  it('evolveStageTimeoutSec is unset by default (derived at call time, see run-flow.ts) and accepts an explicit override', () => {
+    expect(RunConfig.parse({}).evolveStageTimeoutSec).toBeUndefined();
+    expect(RunConfig.parse({ evolveStageTimeoutSec: 2400 }).evolveStageTimeoutSec).toBe(2400);
+    expect(() => RunConfig.parse({ evolveStageTimeoutSec: 0 })).toThrow();
+    expect(() => RunConfig.parse({ evolveStageTimeoutSec: -1 })).toThrow();
+  });
+
   it('an old config.json (no new keys, legacy gates without type/role) still parses', () => {
     const legacy = {
       maxPasses: 3,

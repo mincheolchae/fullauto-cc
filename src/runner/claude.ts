@@ -15,7 +15,7 @@ import { isProtectedEnvName } from '../protected-env.js';
 import { paths } from '../persistence.js';
 import { resolveMcpArgs } from './mcp-args.js';
 import { detachedSpawnOptions, interruptibleSleep, killProcessGroup, shutdownSignal, terminateProcessGroup, track } from './process-group.js';
-import { backoffSecFor, DEFAULT_RATE_LIMIT_BACKOFF, detectRateLimit, type RateLimitBackoff } from './rate-limit.js';
+import { computeRetryWaitMs, DEFAULT_RATE_LIMIT_BACKOFF, detectRateLimit, type RateLimitBackoff } from './rate-limit.js';
 
 // ---------- shared headless spawner ----------
 
@@ -242,11 +242,18 @@ export async function spawnClaudeWithBackoff(
     if (hits > backoff.maxRetries) {
       return { ...res, rateLimitHits: hits, rateLimitWaitMs: waitMs, stillRateLimited: true };
     }
-    const ms = Math.round(backoffSecFor(hits, backoff) * 1000);
+    // Prefer sleeping close to the CLI's own reported reset time over blind
+    // exponential backoff: a session hit early in a long reset window would
+    // otherwise take `log2(resetWindow / maxBackoffSec)`-ish retries, each a
+    // real failed `claude -p` round trip, before the blind schedule catches
+    // up to when the window actually reopens. Falls back to the exponential
+    // schedule when the hint didn't parse (see `computeRetryWaitMs`).
+    const ms = computeRetryWaitMs(signal.resetHint, hits, backoff);
     waitMs += ms;
     onRetry?.({ attempt: hits, waitMs: ms, resetHint: signal.resetHint });
-    // Interruptible: a Ctrl-C during a 15-minute backoff must stop the run
-    // the same way it would mid-subagent, not silently finish waiting first.
+    // Interruptible: a Ctrl-C during a long reset-hint or backoff sleep must
+    // stop the run the same way it would mid-subagent, not silently finish
+    // waiting first.
     await interruptibleSleep(ms);
   }
 }

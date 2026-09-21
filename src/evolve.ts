@@ -23,6 +23,7 @@ import {
   ensureRunStateIgnored,
   reconcileConfigOnResume,
   resetInterrupted,
+  resolveEvolveStageTimeoutSec,
   resolveMcpConfigPath,
   resolvePlannerTimeoutSec,
   runPlanFlow,
@@ -135,8 +136,13 @@ export async function runEvolve(opts: EvolveOptions): Promise<EvolveResult> {
     budgetSec !== undefined && Date.now() - invocationStartedAt >= budgetSec * 1000;
 
   const plannerTimeoutSec = await resolvePlannerTimeoutSec(projectDir, undefined);
+  // shape / assess do materially more work per call than the plain planner
+  // (WebSearch benchmarking, reading state.json + tasks.md + the changed
+  // code, a five-dimension score, rewriting product.md) — see
+  // `evolveStageTimeoutSec`'s doc comment in types.ts.
+  const evolveStageTimeoutSec = await resolveEvolveStageTimeoutSec(projectDir, plannerTimeoutSec);
   const mcpConfigPath = await resolveMcpConfigPath(projectDir);
-  const stageCtx: StageContext = { projectDir, opts, plannerTimeoutSec, mcpConfigPath };
+  const stageCtx: StageContext = { projectDir, opts, plannerTimeoutSec, evolveStageTimeoutSec, mcpConfigPath };
 
   let outcome: EvolveOutcome | undefined;
   let outcomeDetail: string | undefined;
@@ -403,7 +409,10 @@ async function openRound(state: EvolveState, projectDir: string): Promise<Evolve
 interface StageContext {
   projectDir: string;
   opts: EvolveOptions;
+  /** Used by the plan stage — it stays close in shape to the ordinary task planner. */
   plannerTimeoutSec: number;
+  /** Used by the shape and assess stages — see `evolveStageTimeoutSec` in types.ts. */
+  evolveStageTimeoutSec: number;
   mcpConfigPath: string | undefined;
 }
 
@@ -427,7 +436,7 @@ async function shapeStage(ctx: StageContext, state: EvolveState): Promise<void> 
       {
         prompt,
         projectDir,
-        timeoutSec: ctx.plannerTimeoutSec,
+        timeoutSec: ctx.evolveStageTimeoutSec,
         mcpConfigPath: ctx.mcpConfigPath,
         logPath: stageLogPath(projectDir, `shape-attempt${attempt}`),
         logHeader: [`# Evolve shape stage (attempt ${attempt})`],
@@ -438,7 +447,7 @@ async function shapeStage(ctx: StageContext, state: EvolveState): Promise<void> 
     );
     throwIfInterrupted();
     const errors: string[] = [];
-    if (res.timedOut) errors.push(`The previous shaping subagent timed out after ${ctx.plannerTimeoutSec}s — write the file first, explore less.`);
+    if (res.timedOut) errors.push(`The previous shaping subagent timed out after ${ctx.evolveStageTimeoutSec}s — write the file first, explore less.`);
     else if (res.exitCode !== 0) errors.push(`The previous shaping subagent exited with code ${res.exitCode} before the file was accepted.`);
     if (!(await exists(p.productPath))) {
       errors.push(`No file was written at ${p.productPath} — use the Write tool with that exact absolute path.`);
@@ -600,7 +609,7 @@ async function assessStage(ctx: StageContext, state: EvolveState, rec: EvolveRou
       {
         prompt,
         projectDir,
-        timeoutSec: ctx.plannerTimeoutSec,
+        timeoutSec: ctx.evolveStageTimeoutSec,
         mcpConfigPath: ctx.mcpConfigPath,
         logPath: join(roundDir, `assess-attempt${attempt}.log`),
         logHeader: [`# Evolve assess stage — round ${rec.round} (attempt ${attempt})`],
@@ -613,7 +622,7 @@ async function assessStage(ctx: StageContext, state: EvolveState, rec: EvolveRou
     stdout = res.stdout;
     processFailed = res.timedOut || res.exitCode !== 0;
     if (!processFailed) break;
-    printWarn(`Assessor ${res.timedOut ? `timed out after ${ctx.plannerTimeoutSec}s` : `exited with code ${res.exitCode}`}.`);
+    printWarn(`Assessor ${res.timedOut ? `timed out after ${ctx.evolveStageTimeoutSec}s` : `exited with code ${res.exitCode}`}.`);
     await restoreIfBroken(p.productPath, backup);
   }
 
@@ -629,7 +638,7 @@ async function assessStage(ctx: StageContext, state: EvolveState, rec: EvolveRou
   // state.outcome. Mirror shapeStage/planStage and abort instead.
   if (processFailed) {
     throw new EvolveAbort(
-      `Assessor failed twice for round ${rec.round} (timeout or nonzero exit, no output) — aborting rather than continuing with a fabricated verdict. Raise plannerTimeoutSec (product-assess reads the round state, the code, and rewrites product.md — it needs more room than a plain planner call) and resume with \`fullauto evolve\`.`
+      `Assessor failed twice for round ${rec.round} (timeout or nonzero exit, no output) — aborting rather than continuing with a fabricated verdict. Raise evolveStageTimeoutSec in .fullauto/config.json (currently ${ctx.evolveStageTimeoutSec}s; product-assess reads the round state, the code, and rewrites product.md — it needs more room than a plain planner call) and resume with \`fullauto evolve\`.`
     );
   }
 

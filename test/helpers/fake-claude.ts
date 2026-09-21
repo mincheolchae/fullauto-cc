@@ -195,7 +195,16 @@ run_directives() {
       printf '%s\n' "@{directive#stderr }" >&2
       ;;
     rate-limit)
-      printf '%s\n' 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your rate limit. resets at 3:45pm"}}' >&2
+      # Deliberately a RELATIVE hint ("resets in 2 hours"), not a clock time:
+      # a clock-time hint now drives a real sleep-to-reset in
+      # spawnClaudeWithBackoff (src/runner/rate-limit.ts resetHintSleepMs),
+      # which would make tests using tiny configured backoff seconds
+      # actually block for up to hours (capped) instead of the intended
+      # near-instant retry. A relative duration is realistic too (the CLI
+      # emits both shapes) and resetHintSleepMs intentionally leaves it to
+      # the exponential-backoff fallback, which is what backoff timing tests
+      # want to exercise.
+      printf '%s\n' 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your rate limit. resets in 2 hours"}}' >&2
       echo "fake-claude: rate-limit"
       exit_code=1
       ;;

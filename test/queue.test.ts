@@ -1,9 +1,27 @@
 import { describe, it, expect } from 'vitest';
-import { TaskQueue } from '../src/queue.js';
+import { TaskQueue, stuckOnIdenticalGateFailure } from '../src/queue.js';
 import { makeAttempt, makeState, makeTask } from './helpers/fixtures.js';
+import type { GateResult } from '../src/types.js';
 
 const finished = (pass: number) =>
   makeAttempt(pass, { finishedAt: new Date().toISOString() });
+
+/** A `gate_failed` completed attempt shaped exactly like orchestrator.ts's `settleDefer` call leaves it. */
+function gateFailedAttempt(
+  pass: number,
+  gateName: string,
+  exitCode: number,
+  output: string,
+  extraGates: GateResult[] = []
+): ReturnType<typeof makeAttempt> {
+  const failed: GateResult = { name: gateName, passed: false, command: 'x', exitCode, output, durationMs: 1 };
+  return makeAttempt(pass, {
+    finishedAt: new Date().toISOString(),
+    deferReason: 'gate_failed',
+    deferDetail: `Gate "${gateName}" failed (exit ${exitCode}). Captured output below (full output: /tmp/x.log)\n\n\`\`\`\n${output}\n\`\`\``,
+    gateResults: [...extraGates, failed],
+  });
+}
 
 describe('TaskQueue.next — pass-aware eligibility', () => {
   it('pass 1 picks the first pending task in array order and ignores deferred ones', () => {
@@ -141,6 +159,103 @@ describe('TaskQueue.next — one completed attempt per pass', () => {
     }
     expect(seen).toEqual(['T001', 'T002']);
     expect(t).toBeUndefined();
+  });
+});
+
+describe('stuckOnIdenticalGateFailure', () => {
+  it('false with fewer than two completed attempts', () => {
+    expect(stuckOnIdenticalGateFailure(makeTask('T001', { attempts: [] }))).toBe(false);
+    expect(
+      stuckOnIdenticalGateFailure(makeTask('T001', { attempts: [gateFailedAttempt(1, 'test', 1, 'boom')] }))
+    ).toBe(false);
+  });
+
+  it('true when the last two attempts failed the same gate with byte-identical output', () => {
+    const task = makeTask('T001', {
+      attempts: [gateFailedAttempt(1, 'test', 1, 'AssertionError: x !== y\n  at foo.test.ts:12'), gateFailedAttempt(2, 'test', 1, 'AssertionError: x !== y\n  at foo.test.ts:12')],
+    });
+    expect(stuckOnIdenticalGateFailure(task)).toBe(true);
+  });
+
+  it('false when the output differs even slightly — the subagent may be converging', () => {
+    const task = makeTask('T001', {
+      attempts: [
+        gateFailedAttempt(1, 'test', 1, 'AssertionError: x !== y\n  at foo.test.ts:12'),
+        gateFailedAttempt(2, 'test', 1, 'AssertionError: x !== z\n  at foo.test.ts:14'), // different failure
+      ],
+    });
+    expect(stuckOnIdenticalGateFailure(task)).toBe(false);
+  });
+
+  it('false when the failing gate name differs between attempts', () => {
+    const task = makeTask('T001', {
+      attempts: [gateFailedAttempt(1, 'typecheck', 2, 'same text'), gateFailedAttempt(2, 'test', 1, 'same text')],
+    });
+    expect(stuckOnIdenticalGateFailure(task)).toBe(false);
+  });
+
+  it('false when something other than a repeat gate failure sits between (rate limit / subagent error breaks the streak)', () => {
+    const task = makeTask('T001', {
+      attempts: [
+        gateFailedAttempt(1, 'test', 1, 'same output'),
+        makeAttempt(2, { finishedAt: new Date().toISOString(), deferReason: 'rate_limited', deferDetail: 'still rate-limited' }),
+        gateFailedAttempt(3, 'test', 1, 'same output'),
+      ],
+    });
+    // Only the LAST TWO completed attempts matter — rate_limited, then gate_failed.
+    expect(stuckOnIdenticalGateFailure(task)).toBe(false);
+  });
+
+  it('only compares the gate `evaluateGates` actually reported, not any raw-failed gate in gateResults', () => {
+    // Both attempts also carry a raw-failed lint gate that was NOT the
+    // reported cause (e.g. a pre-existing failure the audit ignores) —
+    // it must not be picked up as "the" failure being compared.
+    const otherRawFailure: GateResult = { name: 'lint', passed: false, command: 'x', exitCode: 1, output: 'unrelated pre-existing lint noise', durationMs: 1 };
+    const task = makeTask('T001', {
+      attempts: [
+        gateFailedAttempt(1, 'test', 1, 'same output', [otherRawFailure]),
+        gateFailedAttempt(2, 'test', 1, 'same output', [otherRawFailure]),
+      ],
+    });
+    expect(stuckOnIdenticalGateFailure(task)).toBe(true);
+  });
+
+  it('a fullauto retry (baselineResetAtAttempt) resets the streak — the pre-retry attempts are not consulted', () => {
+    const task = makeTask('T001', {
+      attempts: [
+        gateFailedAttempt(1, 'test', 1, 'same output'),
+        gateFailedAttempt(2, 'test', 1, 'same output'), // would be stuck without the reset
+        gateFailedAttempt(3, 'test', 1, 'same output'), // only one completed attempt since the reset
+      ],
+      baselineResetAtAttempt: 2,
+    });
+    expect(stuckOnIdenticalGateFailure(task)).toBe(false);
+  });
+});
+
+describe('TaskQueue.next — excludes a task stuck on an identical gate failure', () => {
+  it('is skipped by next() but stays deferred, letting other ready tasks through', () => {
+    const state = makeState(
+      [
+        makeTask('T001', {
+          status: 'deferred',
+          attempts: [gateFailedAttempt(1, 'test', 1, 'same output'), gateFailedAttempt(2, 'test', 1, 'same output')],
+        }),
+        makeTask('T002', { status: 'deferred' }),
+      ],
+      { currentPass: 3 }
+    );
+    const q = new TaskQueue(state);
+    expect(q.next()?.id).toBe('T002'); // T001 never offered again
+    expect(state.tasks[0].status).toBe('deferred'); // next() does not itself change status
+  });
+
+  it('a task with only ONE gate_failed attempt so far is still offered (needs two to trip)', () => {
+    const state = makeState(
+      [makeTask('T001', { status: 'deferred', attempts: [gateFailedAttempt(1, 'test', 1, 'x')] })],
+      { currentPass: 2 }
+    );
+    expect(new TaskQueue(state).next()?.id).toBe('T001');
   });
 });
 
