@@ -55,10 +55,15 @@ export interface BackendPreset {
 
 export const DEFAULT_PRESET = 'convex';
 
+// `role` tells the orchestrator what each gate checks. Only `test` / `e2e`
+// change behavior (their failures can be quarantined for TDD red sets and
+// their output is parsed for test counts); the others are stamped so the
+// audit and reports don't have to guess from the name.
 const COMMON_GATES = [
   {
     type: 'shell',
     name: 'typecheck',
+    role: 'typecheck',
     command: 'npm run typecheck --if-present',
     skipIf: 'test ! -f package.json',
   },
@@ -72,13 +77,26 @@ const COMMON_GATES = [
     // even when zero tests matched, defeating the whole verification design.
     type: 'shell',
     name: 'test',
+    role: 'test',
     command: 'npm test --if-present',
     skipIf: 'test ! -f package.json',
   },
   {
     type: 'shell',
     name: 'lint',
+    role: 'lint',
     command: 'npm run lint --if-present',
+    skipIf: 'test ! -f package.json',
+  },
+  {
+    // Separate e2e gate so endpoint / user-journey tests (playwright,
+    // supertest suites under `test:e2e`) run against the real entry point
+    // after the unit suite. `--if-present` makes it a no-op until the
+    // project defines the script, so a fresh project is not blocked.
+    type: 'shell',
+    role: 'e2e',
+    name: 'e2e',
+    command: 'npm run test:e2e --if-present',
     skipIf: 'test ! -f package.json',
   },
 ];

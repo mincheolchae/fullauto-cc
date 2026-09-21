@@ -6,6 +6,9 @@ const FULLAUTO_DIR = '.fullauto';
 const STATE_FILE = 'state.json';
 const CONFIG_FILE = 'config.json';
 const LOGS_DIR = 'logs';
+const PRODUCT_FILE = 'product.md';
+const EVOLVE_STATE_FILE = 'evolve-state.json';
+const ROUNDS_DIR = 'rounds';
 
 export interface PathLayout {
   root: string;
@@ -13,6 +16,12 @@ export interface PathLayout {
   statePath: string;
   configPath: string;
   logsDir: string;
+  /** LLM-owned product brief written by /product-shape (see src/product.ts). */
+  productPath: string;
+  /** Orchestrator-owned `fullauto evolve` loop state. */
+  evolveStatePath: string;
+  /** Per-round archives: `rounds/<r>/{tasks.md,state.json,logs/}`. */
+  roundsDir: string;
 }
 
 export function paths(projectDir: string): PathLayout {
@@ -23,7 +32,15 @@ export function paths(projectDir: string): PathLayout {
     statePath: join(fullautoDir, STATE_FILE),
     configPath: join(fullautoDir, CONFIG_FILE),
     logsDir: join(fullautoDir, LOGS_DIR),
+    productPath: join(fullautoDir, PRODUCT_FILE),
+    evolveStatePath: join(fullautoDir, EVOLVE_STATE_FILE),
+    roundsDir: join(fullautoDir, ROUNDS_DIR),
   };
+}
+
+/** `rounds/<r>/` for one evolve round — the plan, and after the round its state + logs. */
+export function roundDirFor(projectDir: string, round: number): string {
+  return join(paths(projectDir).roundsDir, String(round));
 }
 
 export async function ensureFullautoDir(projectDir: string): Promise<PathLayout> {
@@ -103,6 +120,19 @@ export async function loadUserConfig(
 export function logPathFor(projectDir: string, taskId: string, attempt: number): string {
   const p = paths(projectDir);
   return join(p.logsDir, `${taskId}-attempt${attempt}.log`);
+}
+
+/** Full output of a failed gate — deferDetail only carries the summary (see `summarizeGateOutput`). */
+export function gateLogPathFor(projectDir: string, taskId: string, attempt: number, gateName: string): string {
+  const p = paths(projectDir);
+  const safe = gateName.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 40) || 'gate';
+  return join(p.logsDir, `${taskId}-attempt${attempt}-gate-${safe}.log`);
+}
+
+/** Diff of a rolled-back attempt (see src/rollback.ts), next to its transcript. */
+export function patchPathFor(projectDir: string, taskId: string, attempt: number): string {
+  const p = paths(projectDir);
+  return join(p.logsDir, `${taskId}-attempt${attempt}.patch`);
 }
 
 export async function ensureParent(filePath: string): Promise<void> {

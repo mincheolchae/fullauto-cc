@@ -1,7 +1,24 @@
-import { spawn } from 'node:child_process';
 import { mkdir, readFile, access } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { resolveMcpArgs } from './runner/mcp-args.js';
+import { spawnClaudeWithBackoff } from './runner/claude.js';
+import { DEFAULT_RATE_LIMIT_BACKOFF } from './runner/rate-limit.js';
+
+/**
+ * Product-brief context handed to the planner when `.fullauto/product.md`
+ * exists (written by `fullauto evolve`, or by hand). `round` + `maxTasks`
+ * are set only by the evolve loop and switch on the round-selection rules
+ * and the `<!-- fullauto:round=… -->` header requirement.
+ */
+export interface PlannerProductContext {
+  /** Extracted, capped brief text (see `extractProductContext`). */
+  context: string;
+  /** Absolute path of product.md, so the planner can read the full file if a section was clipped. */
+  productPath: string;
+  /** Evolve round number; absent for `fullauto plan` / `auto`. */
+  round?: number;
+  /** Cap on tasks for the round (evolve only). */
+  maxTasks?: number;
+}
 
 export interface PlannerOptions {
   description: string;
@@ -19,6 +36,12 @@ export interface PlannerOptions {
   mcpConfigPath?: string;
   /** Streaming callback for stdout/stderr. */
   onOutput?: (chunk: string) => void;
+  /** Product brief context (present when `.fullauto/product.md` exists). */
+  productContext?: PlannerProductContext;
+  /** Transcript log path; omitted = no log file (the `plan` / `auto` commands stream to stderr instead). */
+  logPath?: string;
+  /** Fired once per rate-limit backoff cycle (src/runner/rate-limit.ts) — lets the caller print progress on a long unattended wait. */
+  onRateLimit?: (info: { attempt: number; waitMs: number; resetHint?: string }) => void;
 }
 
 export interface PlannerResult {
@@ -36,8 +59,18 @@ export interface PlannerResult {
  */
 export function buildPlannerPrompt(
   description: string,
-  outputPath: string
+  outputPath: string,
+  productContext?: PlannerProductContext
 ): string {
+  const round = productContext?.round;
+  const taskCountRule =
+    round !== undefined && productContext?.maxTasks
+      ? `- At most ${productContext.maxTasks} tasks in total for this round (tests + implementation included). If the selected backlog items need more, select fewer items — never slice an item.`
+      : `- Aim for 3–20 tasks total. If you need more, the request is probably too big for one auto-run; fold related steps into a single task.`;
+  const firstLineRule =
+    round !== undefined
+      ? `The first line of the file must be the round header \`<!-- fullauto:round=${round} items=F001,F004 -->\` (see "Product context"); the task list follows it.`
+      : `The parser expects the first line to start with \`- [ ]\` (or a \`## Feature:\` heading).`;
   return [
     `# Task Decomposition Job`,
     ``,
@@ -46,6 +79,7 @@ export function buildPlannerPrompt(
     `## User request`,
     ``,
     description,
+    ...(productContext ? [``, ...productContextSection(productContext)] : []),
     ``,
     `## Your job`,
     ``,
@@ -65,7 +99,7 @@ export function buildPlannerPrompt(
     `- Order tasks topologically. Declare every real dependency with \`(depends on T###)\`. Independent tasks need no annotation.`,
     `- Every \`(depends on T###)\` must reference a task ID that ALSO appears in this list. Dangling refs leave the orchestrator's queue with permanently-blocked tasks; the validator will reject your output.`,
     `- Skip "research", "explore", "decide", "plan" tasks — make those calls NOW yourself, then write concrete tasks.`,
-    `- Aim for 3–20 tasks total. If you need more, the request is probably too big for one auto-run; fold related steps into a single task.`,
+    taskCountRule,
     `- Indented sub-bullets under a task line are allowed and become part of the task body (specifications, acceptance criteria, file paths). Use them when one line isn't enough.`,
     ``,
     `## Feature grouping (when the request spans multiple distinct features)`,
@@ -86,29 +120,71 @@ export function buildPlannerPrompt(
     ``,
     `Single-feature requests don't need headings. When in doubt, omit them — extraneous headings just create noise.`,
     ``,
-    `## Test coverage (REQUIRED)`,
+    `## Test coverage — TDD pairing (REQUIRED)`,
     ``,
-    `For every task that adds testable runtime behavior — a new endpoint, API handler, service / business-logic function, database mutation, or non-trivial pure function — the task list MUST include a paired test task that exercises that behavior at the runtime level. This is the mechanism by which the orchestrator's verification gate (typecheck/test/lint) actually catches broken behavior — without these test tasks, the gate only catches type/syntax errors and the "feature works" claim is unverified.`,
+    `The orchestrator verifies tasks deterministically: gates (typecheck/test/lint) plus a post-task audit that diffs the tree, checks that new code is actually wired in, and checks that tests were not skipped, weakened or deleted. Your task list must be shaped so those checks have something to bite on.`,
     ``,
-    `Pairing rules:`,
-    `- API / endpoint task → integration test task that hits the endpoint with realistic input and asserts response status + body shape.`,
-    `- Service / business-logic task → unit OR integration test calling the function with realistic input and asserting output (and side-effects, if any).`,
-    `- Database mutation task → test that performs the mutation and verifies the resulting state via a follow-up read.`,
-    `- Pure function task → unit test for happy path + at least one edge case.`,
-    `- Convex/Supabase function task → either an integration test OR a \`convex-fn\` / \`http\` gate (mention it in the task body so the user knows to add it to .fullauto/config.json).`,
+    `For EVERY task that adds testable runtime behavior — a new endpoint, API handler, service / business-logic function, database mutation, CLI command, or non-trivial pure function — emit a RED/GREEN pair, in this order:`,
+    `1. A test task FIRST, marked \`- tdd: red\` and \`- level: unit|integration|e2e\`. The implementer writes ONLY the tests (plus stubs so typecheck passes) and the orchestrator EXPECTS them to fail. The red task MUST carry \`- wired by: T###\` naming the task that first imports its stub from production code — normally the green task; when a later task is the real consumer, point at that one.`,
+    `2. The implementation task, \`(depends on T-test)\`, marked \`- tests: T-test\`. The orchestrator hashes the red tests, forbids the implementer from editing them, and requires them to pass.`,
     ``,
-    `Order: TDD-style is preferred — write the test task FIRST and have the implementation task \`(depends on T###)\` it. The implementation subagent will then read its dependency's test as the contract to satisfy. After-the-fact tests are also acceptable when TDD doesn't fit (e.g., refactors of working code) — pick whichever makes the test task's purpose clearer.`,
+    `Level rules:`,
+    `- Pure function / business logic → \`- level: unit\` (happy path + at least one edge case).`,
+    `- Anything touching a database, filesystem, queue, framework wiring → \`- level: integration\` (exercise the real unit, not a mock of it; verify side-effects with a follow-up read).`,
+    `- Every public HTTP endpoint, CLI command, or core user journey → \`- level: integration\` or \`- level: e2e\` that exercises the REAL entry point (supertest/fetch against the app, the CLI binary, or the project's existing e2e runner) — not a unit test of the handler in isolation.`,
+    `- Convex/Supabase function task → an integration test OR a \`convex-fn\` / \`http\` gate (mention it in the task body so the user knows to add it to .fullauto/config.json).`,
     ``,
-    `When you split tests into a separate task, add a sub-bullet \`- tests: T###\` to the IMPLEMENTATION task pointing at the test task. This is a delegation hint — the implementation subagent has a fallback rule that auto-writes tests inline when no test task is visible, and the sub-bullet is what tells it "tests live elsewhere, focus on implementation." Without this hint you may end up with duplicate test files (one from the test task, one from the implementer's fallback).`,
+    `Skip the pairing ONLY for tasks with no testable runtime behavior, and say so with a marker:`,
+    `- Config / scaffold tasks (\`create directory structure\`, \`add dependency\`, \`set up CI workflow\`): \`- kind: config\`.`,
+    `- Test-runner setup (vitest/jest/pytest config, test script in package.json): \`- kind: config\` + \`- touches-config: adds test runner\` — without the second marker the audit BLOCKS any task that edits test/lint/typecheck config.`,
+    `- UI styling / theming, documentation-only tasks: \`- no test: <reason>\`.`,
+    `If a task must edit PRE-EXISTING tests (a refactor that changes a public signature), add \`- modifies-tests: <reason>\`; otherwise the audit treats a shrinking test file as cheating.`,
     ``,
-    `Skip the test-pairing ONLY for:`,
-    `- Pure config / scaffolding tasks (\`create directory structure\`, \`add dependency to package.json\`, \`set up CI workflow file\`).`,
-    `- UI styling / theming where automated assertion is impractical.`,
-    `- Documentation-only tasks.`,
+    `If the project has no test runner yet (no \`test\` script in package.json, no pytest.ini / pyproject.toml test config, no go test or cargo test conventions visible in the codebase), include a setup task EARLY in the list that adds one (\`- kind: config\` + \`- touches-config: adds test runner\`) — otherwise your test tasks will produce files that the orchestrator's test gate doesn't actually run, defeating the whole point.`,
     ``,
-    `When you skip test-pairing, add a sub-bullet \`- no test: <reason>\` so the user can see your judgment was deliberate, not an oversight.`,
+    `## Wiring (REQUIRED)`,
     ``,
-    `If the project has no test runner yet (no \`test\` script in package.json, no pytest.ini / pyproject.toml test config, no go test or cargo test conventions visible in the codebase), include a setup task EARLY in the list that adds one — otherwise your test tasks will produce files that the orchestrator's test gate doesn't actually run, defeating the whole point.`,
+    `Every task that creates a module / component / route / handler must either wire it into production code in the SAME task (say where in the task body: "mounted in src/app.ts", "rendered by app/page.tsx") or carry \`- wired by: T###\` naming the later task that will. The audit BLOCKS a task that leaves a new file unreferenced by production code, and BLOCKS the \`wired by\` task if the artifact is still orphaned when it finishes. No task may end with unreferenced code.`,
+    ``,
+    `## Risk (recommended)`,
+    ``,
+    `Add \`- risk: high\` to tasks touching auth / sessions / tokens, payments / billing, database schema or migrations, permissions / roles, secrets / crypto, file upload, middleware, admin or destructive operations, public API surface. High-risk tasks get a full multi-reviewer /verify-loop; everything else gets a lighter (cheaper) review. The orchestrator also infers risk from keywords, so this marker mostly matters when the title is bland ("update handler") but the blast radius is not.`,
+    ``,
+    `## Markers reference`,
+    ``,
+    `Sub-bullets the orchestrator parses (one per line, under the task line; anything else in the body is free text):`,
+    `   - kind: test|impl|config|docs`,
+    `   - risk: low|medium|high`,
+    `   - tdd: red|green|none`,
+    `   - level: unit|integration|e2e`,
+    `   - tests: T###          (impl task → its red test task)`,
+    `   - no test: <reason>`,
+    `   - touches-config: <reason>`,
+    `   - modifies-tests: <reason>`,
+    `   - wired by: T###`,
+    ``,
+    `Example shape (a config task, then one red/green pair for an endpoint):`,
+    ``,
+    `   - [ ] T001 Set up vitest with a test script in package.json`,
+    `     - kind: config`,
+    `     - touches-config: adds test runner`,
+    `     - no test: scaffolding only`,
+    `   - [ ] T002 Write failing integration test for POST /login in tests/login.test.ts (depends on T001)`,
+    `     - tdd: red`,
+    `     - level: integration`,
+    `     - wired by: T003`,
+    `     - exercise the real HTTP entry point with supertest: 200 + { token } on valid credentials, 401 on bad password`,
+    `     - (a stub src/routes/login.ts that throws 'not implemented' is fine here; T003 wires it)`,
+    `   - [ ] T003 Implement POST /login handler in src/routes/login.ts and mount it in src/app.ts (depends on T002)`,
+    `     - tests: T002`,
+    `     - risk: high`,
+    `   - [ ] T004 Create LoginForm component in src/components/LoginForm.tsx (depends on T003)`,
+    `     - wired by: T005`,
+    `     - no test: presentational; covered by the page e2e in T006`,
+    `   - [ ] T005 Render LoginForm on app/login/page.tsx (depends on T004)`,
+    `     - no test: page composition; covered by T006`,
+    `   - [ ] T006 Add e2e test for the login journey in e2e/login.spec.ts (depends on T005)`,
+    `     - level: e2e`,
     ``,
     `## Manual prerequisites section (REQUIRED)`,
     ``,
@@ -161,62 +237,67 @@ export function buildPlannerPrompt(
     ``,
     `## Output protocol`,
     ``,
-    `The Write tool result is your only deliverable. Stdout commentary is ignored by the orchestrator. Do not wrap the task list in markdown code fences. Do not add a preamble or trailing prose inside the file — the parser expects the first line to start with \`- [ ]\`. Never write a refusal, a question, or a clarification request as the file contents — make the call and produce the task list.`,
+    `The Write tool result is your only deliverable. Stdout commentary is ignored by the orchestrator. Do not wrap the task list in markdown code fences. Do not add a preamble or trailing prose inside the file — ${firstLineRule} Never write a refusal, a question, or a clarification request as the file contents — make the call and produce the task list.`,
   ].join('\n');
+}
+
+/**
+ * `## Product context` — the brief inlined (capped by `extractProductContext`)
+ * plus the rules that keep a plan consistent with it. With `round` set
+ * (evolve), the round-selection rules and the header requirement are added:
+ * the orchestrator parses `<!-- fullauto:round=<r> items=… -->` to record
+ * which backlog ids the round covers.
+ */
+export function productContextSection(pc: PlannerProductContext): string[] {
+  const lines = [
+    `## Product context`,
+    ``,
+    `The project has a product brief at ${pc.productPath} — the source of truth for who the product is for, what is in scope, and what was already decided. The relevant parts are inlined below; read the full file only if you need a section that was clipped.`,
+    ``,
+    pc.context,
+    ``,
+    `Rules for staying consistent with the brief:`,
+    `- Every task must serve the brief's target users and core value and respect its Principles & constraints — non-goals are off-limits.`,
+    `- Prefer Backlog items over inventing new scope; keep Decisions as they are (do not re-decide the stack, auth model, persistence or hosting).`,
+    `- Group the tasks of each backlog item under \`## Feature: <F00x> <feature title>\` (e.g. \`## Feature: F003 Share a note by link\`) so the run reports and the assessor can map tasks back to features.`,
+  ];
+  if (pc.round !== undefined) {
+    const max = pc.maxTasks ?? 12;
+    lines.push(
+      ``,
+      `### Round ${pc.round} selection rules (evolve mode)`,
+      `- This is round ${pc.round} of an autonomous product-evolution loop. Walk the Backlog in order and select items until the next one would push the round past ${max} tasks in total. Select at least one item.`,
+      `- Skip items whose Feature map status is \`done\` or \`rejected\`; a \`deferred\` item may be re-selected when its blocker is gone (say so in a sub-bullet).`,
+      `- Every selected item must be FULLY usable when its tasks finish: UI (when the product has one) + logic + wiring + tests + empty / loading / error states. No half-features — if an item does not fit whole, take fewer items, never a slice of one.`,
+      `- Write the round header as the FIRST line of the file, listing exactly the selected ids:`,
+      ``,
+      `   <!-- fullauto:round=${pc.round} items=F001,F004 -->`,
+      ``,
+      `- Depth before breadth: polish and harden what exists (the items the assessor marked \`next\`, P1 fixes) before adding new surface.`
+    );
+  }
+  return lines;
 }
 
 export async function runPlanner(opts: PlannerOptions): Promise<PlannerResult> {
   const { description, projectDir, outputPath, timeoutSec = 900, mcpConfigPath, onOutput } =
     opts;
   await mkdir(dirname(outputPath), { recursive: true });
-  const prompt = buildPlannerPrompt(description, outputPath);
-  const startedAt = Date.now();
-
-  // Resolve --mcp-config BEFORE the spawn promise so the same vetting
-  // (lexical + realpath containment) the implementer subagent uses also
-  // applies here. Without this the planner is blind to schemas that live
-  // outside the repo (Convex deployment, Supabase project) and falls back
-  // to source-file inspection only.
-  const mcpArgs = await resolveMcpArgs(projectDir, mcpConfigPath);
-
-  return new Promise<PlannerResult>((resolve) => {
-    const child = spawn(
-      'claude',
-      ['-p', prompt, '--permission-mode', 'bypassPermissions', ...mcpArgs],
-      {
-        cwd: projectDir,
-        env: process.env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      }
-    );
-
-    let timedOut = false;
-    let settled = false;
-
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 5000);
-    }, timeoutSec * 1000);
-
-    child.stdout.on('data', (d: Buffer) => onOutput?.(d.toString('utf-8')));
-    child.stderr.on('data', (d: Buffer) => onOutput?.(d.toString('utf-8')));
-
-    const finalize = (exitCode: number): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve({
-        outputPath,
-        exitCode,
-        timedOut,
-        durationMs: Date.now() - startedAt,
-      });
-    };
-
-    child.on('error', () => finalize(-1));
-    child.on('close', (code) => finalize(code ?? -1));
-  });
+  const prompt = buildPlannerPrompt(description, outputPath, opts.productContext);
+  const res = await spawnClaudeWithBackoff(
+    {
+      prompt,
+      projectDir,
+      timeoutSec,
+      mcpConfigPath,
+      onOutput,
+      logPath: opts.logPath,
+      logHeader: opts.logPath ? [`# Planner transcript → ${outputPath}`] : undefined,
+    },
+    DEFAULT_RATE_LIMIT_BACKOFF,
+    opts.onRateLimit
+  );
+  return { outputPath, exitCode: res.exitCode, timedOut: res.timedOut, durationMs: res.durationMs };
 }
 
 export interface PlannerOutputCheck {

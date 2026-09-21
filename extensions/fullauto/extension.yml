@@ -1,0 +1,27 @@
+schema_version: "1.0"
+
+extension:
+  id: "fullauto"
+  name: "Full Auto"
+  version: "1.0.0"
+  description: "Drive specs/<feature>/tasks.md to completion with fullauto-cc: one fresh subagent per task, deterministic gates + audit, adaptive /verify-loop, resumable state."
+  author: "Mincheol Chae"
+  repository: "https://github.com/mincheolchae/fullauto-cc"
+  license: "MIT"
+  homepage: "https://github.com/mincheolchae/fullauto-cc#readme"
+
+requires:
+  speckit_version: ">=1.0.0"
+
+provides:
+  commands:
+    - name: "speckit.fullauto.run"
+      file: "commands/run.md"
+      description: "Run the fullauto verified implementation loop over the current feature's tasks.md (replaces /speckit-implement)"
+
+hooks:
+  after_tasks:
+    command: "speckit.fullauto.run"
+    optional: true
+    prompt: "Run the fullauto verified implementation loop over tasks.md now? (one fresh subagent per task, gates + audit + adaptive verify-loop)"
+    description: "Autonomous, verified implement loop over tasks.md via fullauto-cc"

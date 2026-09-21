@@ -1,4 +1,5 @@
 import type { Task } from './types.js';
+import { parseTaskMarkers } from './task-class.js';
 
 /**
  * Result of validating a planner-emitted task list. `ok: true` means the
@@ -41,6 +42,16 @@ export interface PlanValidationResult {
  *      become eligible (`dependenciesSatisfied` requires all deps to be
  *      `done`), so they burn through `maxPasses` as deferred and fail at
  *      the end. Better to surface the cycle now.
+ *
+ *   4. Marker references — `- tests: T###` / `- tested by: T###` /
+ *      `- wired by: T###` naming a task that is not in the list. The
+ *      classifier ignores such a marker at runtime (the task is then held
+ *      to the normal rules), but a plan that promises tests or wiring to a
+ *      task that does not exist is wrong, not merely sloppy. A `wired by`
+ *      target that appears EARLIER in the file is a warning: the wiring
+ *      task runs first and cannot wire an artifact that does not exist yet
+ *      (the classifier ignores the marker once that task is done and the
+ *      creating task has to wire the artifact itself).
  *
  * Tests intentionally NOT validated here: paired-test enforcement,
  * Manual Prerequisites section presence, Assumptions section presence.
@@ -88,6 +99,33 @@ export function validatePlanShape(tasks: Task[]): PlanValidationResult {
   for (const path of cycles) {
     errors.push(`Dependency cycle: ${path}.`);
   }
+
+  // 4. Marker references.
+  const position = new Map(tasks.map((t, i) => [t.id, i] as const));
+  tasks.forEach((t, index) => {
+    const markers = parseTaskMarkers(t.body);
+    for (const id of markers.tests) {
+      if (!knownIds.has(id)) {
+        errors.push(
+          `Task ${t.id} says \`- tests: ${id}\` but ${id} is not in the task list — point it at the task that writes the tests, or drop the marker so ${t.id} carries its own tests.`
+        );
+      }
+    }
+    const wiredBy = markers.wiredBy;
+    if (wiredBy !== undefined) {
+      if (!knownIds.has(wiredBy)) {
+        errors.push(
+          `Task ${t.id} says \`- wired by: ${wiredBy}\` but ${wiredBy} is not in the task list — nobody would wire the artifact; name the task that imports/mounts it, or wire it in ${t.id}.`
+        );
+      } else if (wiredBy === t.id) {
+        errors.push(`Task ${t.id} says \`- wired by: ${wiredBy}\` (itself) — a task cannot promise its own wiring to a later task; drop the marker.`);
+      } else if ((position.get(wiredBy) ?? Infinity) < index) {
+        warnings.push(
+          `Task ${t.id} says \`- wired by: ${wiredBy}\` but ${wiredBy} appears earlier in the file — the wiring task would run first and cannot wire an artifact that does not exist yet; move ${wiredBy} after ${t.id} (with \`depends on ${t.id}\`) or wire the artifact in ${t.id}.`
+        );
+      }
+    }
+  });
 
   return { ok: errors.length === 0, errors, warnings };
 }

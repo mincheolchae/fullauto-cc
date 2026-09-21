@@ -2,10 +2,7 @@
 import { Command } from 'commander';
 import { dirname, resolve } from 'node:path';
 import { access } from 'node:fs/promises';
-import {
-  loadPrerequisitesFromFile,
-  loadTasksFromFile,
-} from './parsers/speckit.js';
+import { loadPrerequisitesFromFile } from './parsers/speckit.js';
 import {
   DEFAULT_PRESET,
   PRESETS,
@@ -17,16 +14,32 @@ import { expandMcpEnvPlaceholders } from './init/mcp-config.js';
 import {
   ensureFullautoDir,
   loadState,
-  loadUserConfig,
   saveConfigSnapshot,
   saveState,
   paths,
 } from './persistence.js';
-import { RunConfig, RunState, type Task } from './types.js';
+import { VERIFY_MODES, type VerifyMode } from './types.js';
 import { runOrchestrator } from './orchestrator.js';
-import { runPlanner, checkPlannerOutput } from './planner.js';
-import { validatePlanShape } from './plan-validator.js';
+import { InterruptedError, installSignalHandlers } from './runner/process-group.js';
+import { renderFindings } from './audit/index.js';
+import { runManualAudit } from './audit/manual.js';
 import {
+  applyVerifyOverride,
+  ensureGitignoreEntry,
+  ensureRunStateIgnored,
+  exitCodeForRun,
+  loadPlannerProductContext,
+  reconcileConfigOnResume,
+  requeueFailedTasks,
+  resetInterrupted,
+  resolvePlannerTimeoutSec,
+  retryPassLimit,
+  runPlanFlow,
+  startFreshRun,
+} from './run-flow.js';
+import { runEvolve, EVOLVE_DEFAULTS } from './evolve.js';
+import {
+  formatKst,
   printError,
   printFinalReport,
   printInfo,
@@ -219,44 +232,33 @@ async function writeJsonFile(
 }
 
 
-/**
- * Idempotently ensure `entry` is present in the project's .gitignore. Creates
- * the file if missing. Returns true if a write happened (entry added), false
- * if it was already present.
- */
-async function ensureGitignoreEntry(
-  projectDir: string,
-  entry: string
-): Promise<boolean> {
-  const path = resolve(projectDir, '.gitignore');
-  const { readFile, writeFile } = await import('node:fs/promises');
-  let existing = '';
-  try {
-    existing = await readFile(path, 'utf-8');
-  } catch {
-    // .gitignore doesn't exist; we'll create it
-  }
-  const lines = existing.split(/\r?\n/);
-  const normalizedEntry = entry.trim();
-  // Match exact line OR line with the same path but stripped trailing slash —
-  // both `.fullauto` and `.fullauto/` mean the same thing in .gitignore.
-  const alreadyPresent = lines.some((l) => {
-    const t = l.trim();
-    return (
-      t === normalizedEntry ||
-      t === normalizedEntry.replace(/\/$/, '') ||
-      t === `${normalizedEntry.replace(/\/$/, '')}/`
-    );
-  });
-  if (alreadyPresent) return false;
-  const newline = existing.endsWith('\n') || existing === '' ? '' : '\n';
-  await writeFile(path, `${existing}${newline}${normalizedEntry}\n`, 'utf-8');
-  return true;
+const VERIFY_OPTION_HELP =
+  `Verification depth policy, overrides config.verifyMode: ${VERIFY_MODES.join(' | ')}. ` +
+  `adaptive (default) = per-task depth from classification (config/docs/test/low-risk → gates only, medium → light, high-risk → full); ` +
+  `full = /verify-loop depth=full on every task; gates-only = never invoke /verify-loop; ` +
+  `feature = gates-only per task + one full /verify-loop over each feature group's combined diff.`;
+
+/** commander argParser: reject anything outside the enum with a readable error. */
+function parseVerifyMode(value: string): VerifyMode {
+  const v = value.trim().toLowerCase();
+  if ((VERIFY_MODES as readonly string[]).includes(v)) return v as VerifyMode;
+  throw new Error(`--verify must be one of: ${VERIFY_MODES.join(', ')} (got "${value}")`);
+}
+
+/** commander argParser for positive-integer flags (`--rounds 3`), with a readable error. */
+function parsePositiveInt(flag: string): (value: string) => number {
+  return (value: string) => {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new Error(`${flag} must be a positive integer (got "${value}")`);
+    }
+    return n;
+  };
 }
 
 program
   .command('run')
-  .argument('<tasks-file>', 'Path to tasks.md (e.g. speckit /speckit.tasks output)')
+  .argument('<tasks-file>', 'Path to tasks.md (e.g. speckit /speckit-tasks output)')
   .description('Parse tasks file and start the orchestrator from a fresh state.')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('-v, --verbose', 'Stream subagent output to stdout', false)
@@ -275,6 +277,7 @@ program
     'After each feature group finishes, run a /vibe-enhance pass — researcher subagent compares against latest trends and applies scoped additions, then routes them through /verify-loop. Feature groups are auto-detected from [USx] labels (Speckit format) or `## ` h2 headings (hand-written). No grouping = one pass at the end.',
     false
   )
+  .option('--verify <mode>', VERIFY_OPTION_HELP, parseVerifyMode)
   .action(
     async (
       tasksFile: string,
@@ -284,6 +287,7 @@ program
         force: boolean;
         strictPrereqs: boolean;
         vibeEnhance: boolean;
+        verify?: VerifyMode;
       }
     ) => {
       const projectDir = resolve(opts.dir);
@@ -308,186 +312,25 @@ program
           );
         }
         await reconcileConfigOnResume(projectDir, existing);
-        for (const t of existing.tasks) {
-          if (t.status === 'in_progress') t.status = 'pending';
-        }
-        await runOrchestrator({ projectDir, state: existing, verbose: opts.verbose });
+        applyVerifyOverride(existing.config, opts.verify);
+        await ensureRunStateIgnored(projectDir);
+        await resetInterrupted(projectDir, existing);
+        const resumed = await runOrchestrator({ projectDir, state: existing, verbose: opts.verbose });
+        process.exitCode = exitCodeForRun(resumed);
         return;
       }
 
-      await startFreshRun({
+      const started = await startFreshRun({
         projectDir,
         tasksPath: resolve(tasksFile),
         verbose: opts.verbose,
         strictPrereqs: opts.strictPrereqs,
         vibeEnhance: opts.vibeEnhance,
+        verifyMode: opts.verify,
       });
+      process.exitCode = exitCodeForRun(started);
     }
   );
-
-/**
- * On resume, prefer the live `.fullauto/config.json` over the snapshot saved
- * inside `state.json`. This lets the user edit gates / timeouts / passes
- * after a crash without having to discard state. If the file changed, log
- * the diff so the user knows their edits took effect.
- */
-async function reconcileConfigOnResume(
-  projectDir: string,
-  state: RunState
-): Promise<void> {
-  const liveRaw = await loadUserConfig(projectDir);
-  if (!liveRaw) return;
-  let live: ReturnType<typeof RunConfig.parse>;
-  try {
-    live = RunConfig.parse(liveRaw);
-  } catch {
-    printWarn(
-      `.fullauto/config.json failed to parse on resume — keeping snapshotted config from state.json.`
-    );
-    return;
-  }
-  const snapshotJson = JSON.stringify(state.config);
-  const liveJson = JSON.stringify(live);
-  if (snapshotJson === liveJson) return;
-  state.config = live;
-  printInfo(`Detected edits in .fullauto/config.json — using updated config.`);
-}
-
-/**
- * Common path for "fresh run from a tasks.md file": load the tasks, validate
- * the config has gates, init state, persist, and start the orchestrator.
- * Used by both `fullauto run` and `fullauto auto`.
- *
- * Returns false if startup was aborted (e.g. empty gates), true if the run
- * actually started.
- */
-async function startFreshRun(args: {
-  projectDir: string;
-  tasksPath: string;
-  verbose: boolean;
-  strictPrereqs?: boolean;
-  /**
-   * `auto` mode seeds placeholder values for unset [ENV] items so subagents
-   * can still spawn and the run is reported at end; `run` mode just warns
-   * about missing env vars and proceeds. Neither mode prompts the user.
-   */
-  autoMode?: boolean;
-  /** CLI-level override for config.vibeEnhance. When true, force-enable. */
-  vibeEnhance?: boolean;
-  /**
-   * Timing fields for the final report. Captured by the caller so `auto`
-   * mode can include the planner stage in the total wall-clock. When
-   * omitted (e.g. `run` mode), the orchestrator's startedAt covers the
-   * full elapsed window.
-   */
-  commandStartedAt?: string;
-  planStartedAt?: string;
-  planFinishedAt?: string;
-}): Promise<boolean> {
-  const { projectDir, tasksPath, verbose, autoMode } = args;
-  const tasks = await loadTasksFromFile(tasksPath);
-
-  // Validate the parsed task list BEFORE the orchestrator inherits it.
-  // This catches dangling deps / cycles / duplicate IDs in hand-written
-  // tasks.md and speckit output too — `runPlanFlow` already validates
-  // its own planner output, but `fullauto run <file>` came in here
-  // direct without going through that path. Without this, queue.ts:131's
-  // "unknown deps treated as satisfied" fallback and orchestrator.ts:60-65's
-  // cycle-warn-and-proceed silently let the bad plan execute.
-  const validation = validatePlanShape(tasks);
-  if (!validation.ok) {
-    printError(
-      `Tasks file failed validation (${validation.errors.length} error(s)):`
-    );
-    for (const e of validation.errors) console.error(`    • ${e}`);
-    console.error(
-      `  Tasks file: ${tasksPath}\n  Edit it to resolve the issues, then re-run.`
-    );
-    process.exitCode = 2;
-    return false;
-  }
-  for (const w of validation.warnings) printWarn(w);
-
-  const userConfig = (await loadUserConfig(projectDir)) ?? {};
-  const config = RunConfig.parse(userConfig);
-  // CLI flag forces vibeEnhance on for this run. We deliberately don't
-  // implement a way to force it OFF from the CLI — config.json is the place
-  // for that. (If users want it permanently on, set it in config.json and
-  // skip the flag.)
-  if (args.vibeEnhance) config.vibeEnhance = true;
-
-  // An empty gates list silently makes every task auto-pass (allGatesPassed
-  // returns true on []), defeating the whole verification design.
-  if (config.gates.length === 0) {
-    printError(
-      `Refusing to run: config has no verification gates. Without gates, every task is auto-passed without any check. Run \`fullauto init\` to write the default gate config, or add at least one gate to .fullauto/config.json.`
-    );
-    process.exitCode = 2;
-    return false;
-  }
-
-  printInfo(
-    `Loaded ${tasks.length} task(s) from ${tasksPath}. Project: ${projectDir}`
-  );
-
-  // Surface manual prerequisites then proceed without prompting. `auto` mode
-  // additionally seeds placeholder env values so subagents can still spawn
-  // even when real credentials aren't set; `run` mode only refuses to start
-  // when --strict-prereqs is set AND a [ENV] prereq is unset.
-  let placeholderEnvs: string[] = [];
-  if (autoMode) {
-    placeholderEnvs = await collectPlaceholderEnvs(tasksPath);
-  } else {
-    const proceed = await surfacePrerequisites(tasksPath, {
-      strict: args.strictPrereqs ?? false,
-    });
-    if (!proceed) return false;
-  }
-
-  const startedAt = new Date().toISOString();
-  const state: RunState = {
-    startedAt,
-    currentPass: 1,
-    tasks,
-    config,
-    passSnapshots: [],
-    placeholderEnvs,
-    commandStartedAt: args.commandStartedAt ?? startedAt,
-    planStartedAt: args.planStartedAt,
-    planFinishedAt: args.planFinishedAt,
-  };
-  await saveState(projectDir, state);
-
-  await runOrchestrator({ projectDir, state, verbose });
-  return true;
-}
-
-/**
- * In `auto` mode: print the prereq checklist for visibility, then return the
- * subset of [ENV] entries with valid POSIX names whose value is unset. The
- * orchestrator seeds those into spawned subagents as FULLAUTO_PLACEHOLDER_<N>
- * and reports them at run end so the user knows what to replace.
- */
-async function collectPlaceholderEnvs(tasksPath: string): Promise<string[]> {
-  const prereqs = await loadPrerequisitesFromFile(tasksPath);
-  if (prereqs.length === 0) return [];
-  printPrerequisites(prereqs);
-  const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-  const missing = prereqs
-    .filter(
-      (p) =>
-        p.kind === 'ENV' &&
-        ENV_NAME.test(p.identifier) &&
-        !process.env[p.identifier]
-    )
-    .map((p) => p.identifier);
-  if (missing.length > 0) {
-    printInfo(
-      `auto mode: seeding ${missing.length} placeholder env var(s) for subagents — will be reported at run end for replacement.`
-    );
-  }
-  return missing;
-}
 
 program
   .command('plan')
@@ -528,137 +371,16 @@ program
         description,
         outputPath,
         timeoutSec: await resolvePlannerTimeoutSec(projectDir, opts.timeout),
+        productContext: await loadPlannerProductContext(projectDir),
       });
-      if (planResult) {
-        const prereqs = await loadPrerequisitesFromFile(planResult.tasksPath);
-        printPrerequisites(prereqs);
+      if (!planResult) {
+        process.exitCode = 1;
+        return;
       }
+      const prereqs = await loadPrerequisitesFromFile(planResult.tasksPath);
+      printPrerequisites(prereqs);
     }
   );
-
-/**
- * Resolve the planner timeout from (a) explicit CLI flag, falling back to
- * (b) `.fullauto/config.json`'s `plannerTimeoutSec`, then (c) the schema
- * default (900s). The CLI flag wins when present so users can ad-hoc bump
- * a tight planner without permanently editing config.
- *
- * Loads config via the user-config path so the same precedence applies to
- * `plan` (which never touches RunConfig defaults) and `auto` (which does).
- * If the file is missing or unparseable, falls through silently — the
- * planner is independent of orchestrator gating.
- */
-async function resolvePlannerTimeoutSec(
-  projectDir: string,
-  cliFlag: number | undefined
-): Promise<number> {
-  if (cliFlag !== undefined) return cliFlag;
-  const raw = await loadUserConfig(projectDir);
-  if (raw) {
-    const parsed = RunConfig.safeParse(raw);
-    if (parsed.success) return parsed.data.plannerTimeoutSec;
-  }
-  // Fall back to the schema default.
-  return RunConfig.parse({}).plannerTimeoutSec;
-}
-
-/**
- * Returns the path of the planner-written tasks file on success, or null if
- * the planner failed or wrote nothing. Caller decides whether to chain into
- * a run.
- *
- * Also returns ISO timestamps marking when the planner subagent started and
- * finished. Pass these into `startFreshRun` so the final report can show
- * the plan stage's wall-clock alongside per-task and total durations.
- */
-async function runPlanFlow(args: {
-  projectDir: string;
-  description: string;
-  outputPath: string;
-  timeoutSec: number;
-}): Promise<{ tasksPath: string; planStartedAt: string; planFinishedAt: string } | null> {
-  const { projectDir, description, outputPath, timeoutSec } = args;
-  printInfo(
-    `Planning: "${description.length > 100 ? description.slice(0, 97) + '...' : description}"`
-  );
-  printInfo(`Output: ${outputPath}`);
-
-  // Forward `mcpConfigPath` from the user config so the planner sees the same
-  // MCP servers (Convex / Supabase / etc.) as the implementer subagents. Lets
-  // the planner introspect external schemas while decomposing — without this
-  // it's limited to whatever lives in source files.
-  const userConfigRaw = await loadUserConfig(projectDir);
-  let mcpConfigPath: string | undefined;
-  if (userConfigRaw) {
-    const parsed = RunConfig.safeParse(userConfigRaw);
-    if (parsed.success) mcpConfigPath = parsed.data.mcpConfigPath;
-  }
-
-  const planStartedAt = new Date().toISOString();
-  const result = await runPlanner({
-    description,
-    projectDir,
-    outputPath,
-    timeoutSec,
-    mcpConfigPath,
-    // Planner output is usually short; let it through to stdout so the user
-    // can see what the subagent is doing without needing --verbose.
-    onOutput: (chunk) => process.stderr.write(chunk),
-  });
-  const planFinishedAt = new Date().toISOString();
-
-  if (result.timedOut) {
-    printError(`Planner timed out after ${timeoutSec}s.`);
-    process.exitCode = 1;
-    return null;
-  }
-  if (result.exitCode !== 0) {
-    printError(`Planner exited with code ${result.exitCode}.`);
-    process.exitCode = 1;
-    return null;
-  }
-
-  const check = await checkPlannerOutput(outputPath);
-  if (!check.exists) {
-    printError(
-      `Planner exited 0 but did not create ${outputPath}. The subagent likely ignored the Write instruction — try a more specific description, or run \`fullauto plan\` and paste the output manually.`
-    );
-    process.exitCode = 1;
-    return null;
-  }
-
-  // Validate the shape BEFORE the orchestrator inherits it. The queue's
-  // dangling-dep fallback ("treat unknown deps as satisfied") and the
-  // orchestrator's cycle-warn-then-proceed are too forgiving for this
-  // surface — a malformed plan slips through and runs to completion with
-  // wrong work. Fail fast so the user sees the issue while the original
-  // request is still in their head.
-  let parsedTasks: Task[];
-  try {
-    parsedTasks = await loadTasksFromFile(outputPath);
-  } catch (err) {
-    printError(
-      `Planner output failed to parse: ${(err as Error).message}\n  Tasks file: ${outputPath}`
-    );
-    process.exitCode = 1;
-    return null;
-  }
-  const validation = validatePlanShape(parsedTasks);
-  if (!validation.ok) {
-    printError(
-      `Planner output failed validation (${validation.errors.length} error(s)):`
-    );
-    for (const e of validation.errors) console.error(`    • ${e}`);
-    console.error(
-      `  Tasks file: ${outputPath}\n  Edit it manually and re-run \`fullauto run\`, or re-issue the plan command with a sharper description.`
-    );
-    process.exitCode = 1;
-    return null;
-  }
-  for (const w of validation.warnings) printWarn(w);
-
-  printInfo(`Wrote tasks file: ${outputPath} (${parsedTasks.length} task(s) validated).`);
-  return { tasksPath: outputPath, planStartedAt, planFinishedAt };
-}
 
 program
   .command('auto')
@@ -691,6 +413,7 @@ program
     'After all planned tasks finish, run a /vibe-enhance pass — fresh researcher subagent looks for trend-based additions beyond what was specified, applies scoped ones, and routes them through /verify-loop.',
     false
   )
+  .option('--verify <mode>', VERIFY_OPTION_HELP, parseVerifyMode)
   .action(
     async (
       descriptionParts: string[],
@@ -701,6 +424,7 @@ program
         output: string;
         planTimeout?: number;
         vibeEnhance: boolean;
+        verify?: VerifyMode;
       }
     ) => {
       const projectDir = resolve(opts.dir);
@@ -717,14 +441,15 @@ program
           );
         }
         await reconcileConfigOnResume(projectDir, existing);
-        for (const t of existing.tasks) {
-          if (t.status === 'in_progress') t.status = 'pending';
-        }
-        await runOrchestrator({
+        applyVerifyOverride(existing.config, opts.verify);
+        await ensureRunStateIgnored(projectDir);
+        await resetInterrupted(projectDir, existing);
+        const resumed = await runOrchestrator({
           projectDir,
           state: existing,
           verbose: opts.verbose,
         });
+        process.exitCode = exitCodeForRun(resumed);
         return;
       }
 
@@ -742,20 +467,81 @@ program
         description,
         outputPath,
         timeoutSec: await resolvePlannerTimeoutSec(projectDir, opts.planTimeout),
+        productContext: await loadPlannerProductContext(projectDir),
       });
-      if (!planResult) return; // planner failed — exit codes set inside
+      if (!planResult) {
+        process.exitCode = 1; // planner failed — reasons were printed inside
+        return;
+      }
 
       printInfo(`Plan accepted — handing off to orchestrator.`);
-      await startFreshRun({
+      const started = await startFreshRun({
         projectDir,
         tasksPath: planResult.tasksPath,
         verbose: opts.verbose,
         autoMode: true,
         vibeEnhance: opts.vibeEnhance,
+        verifyMode: opts.verify,
         commandStartedAt,
         planStartedAt: planResult.planStartedAt,
         planFinishedAt: planResult.planFinishedAt,
       });
+      process.exitCode = exitCodeForRun(started);
+    }
+  );
+
+program
+  .command('evolve')
+  .argument(
+    '[concept...]',
+    'Short product concept in your words (omit it to resume an in-progress evolve from .fullauto/evolve-state.json)'
+  )
+  .description(
+    'Concept → product, unattended: shape a product brief (/product-shape), then loop plan → run → assess (/product-assess) for up to --rounds rounds. Every round is a normal fullauto run (gates + audit + verify), archived under .fullauto/rounds/<r>/. Stops on a ship/stop verdict, the round cap, the time budget, or a round with no progress.'
+  )
+  .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .option('-v, --verbose', 'Stream subagent output to stdout', false)
+  .option('--rounds <n>', `Maximum number of rounds (default: ${EVOLVE_DEFAULTS.maxRounds}). On resume, a larger value extends a finished evolve.`, parsePositiveInt('--rounds'))
+  .option('--max-tasks-per-round <n>', `Task cap the planner must respect per round (default: ${EVOLVE_DEFAULTS.maxTasksPerRound}).`, parsePositiveInt('--max-tasks-per-round'))
+  .option('--time-budget <sec>', 'Wall-clock budget for THIS invocation in seconds; checked between stages (a resume gets a fresh budget).', parsePositiveInt('--time-budget'))
+  .option('--vibe-enhance', 'Run a /vibe-enhance pass after each feature group in every round (grounded in the product brief).', false)
+  .option('--ux', 'Let /product-assess run /ux-walkthrough (browser / API / CLI journeys) when the project is runnable.', false)
+  .option('--verify <mode>', VERIFY_OPTION_HELP, parseVerifyMode)
+  .option('-f, --force', 'Discard an existing evolve-state.json and round archives and start over (product.md is kept unless --reshape).', false)
+  .option('--reshape', 'With --force: also discard product.md (backed up to product.prev.md) and re-run the shaping stage.', false)
+  .action(
+    async function (
+      this: Command,
+      conceptParts: string[],
+      opts: {
+        dir: string;
+        verbose: boolean;
+        rounds?: number;
+        maxTasksPerRound?: number;
+        timeBudget?: number;
+        vibeEnhance: boolean;
+        ux: boolean;
+        verify?: VerifyMode;
+        force: boolean;
+        reshape: boolean;
+      }
+    ) {
+      const projectDir = resolve(opts.dir);
+      const concept = conceptParts.join(' ').trim();
+      const result = await runEvolve({
+        projectDir,
+        concept: concept || undefined,
+        rounds: opts.rounds,
+        maxTasksPerRound: opts.maxTasksPerRound,
+        timeBudgetSec: opts.timeBudget,
+        vibeEnhance: opts.vibeEnhance,
+        ux: opts.ux,
+        verifyMode: opts.verify,
+        force: opts.force,
+        reshape: opts.reshape,
+        verbose: opts.verbose,
+      });
+      process.exitCode = result.exitCode;
     }
   );
 
@@ -764,7 +550,8 @@ program
   .description('Resume an in-progress run from .fullauto/state.json.')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('-v, --verbose', 'Stream subagent output to stdout', false)
-  .action(async (opts: { dir: string; verbose: boolean }) => {
+  .option('--retry-failed', 'Also re-queue every failed task (alias for `fullauto retry` with no ids).', false)
+  .action(async (opts: { dir: string; verbose: boolean; retryFailed: boolean }) => {
     const projectDir = resolve(opts.dir);
     const state = await loadState(projectDir);
     if (!state) {
@@ -772,14 +559,58 @@ program
       process.exitCode = 2;
       return;
     }
-    // If a task was caught mid-flight (in_progress), reset it back to pending so
-    // it gets re-attempted in the next pass.
-    for (const t of state.tasks) {
-      if (t.status === 'in_progress') t.status = 'pending';
-    }
+    await resetInterrupted(projectDir, state);
     await reconcileConfigOnResume(projectDir, state);
+    await ensureRunStateIgnored(projectDir);
+    if (opts.retryFailed) {
+      const plan = requeueFailedTasks(state);
+      if (plan.requeued.length === 0) printInfo('--retry-failed: no failed tasks to re-queue.');
+      else printInfo(`--retry-failed: re-queued ${plan.requeued.join(', ')} as deferred in pass ${state.currentPass} (pass budget now ${retryPassLimit(state)}).`);
+      await saveState(projectDir, state);
+    }
     printResume(paths(projectDir).statePath);
-    await runOrchestrator({ projectDir, state, verbose: opts.verbose });
+    const result = await runOrchestrator({ projectDir, state, verbose: opts.verbose });
+    process.exitCode = exitCodeForRun(result);
+  });
+
+program
+  .command('retry')
+  .argument('[ids...]', 'Task ids to retry (default: every failed task). Failed tasks that only waited on a retried dependency are re-queued with it.')
+  .description(
+    'Re-run failed tasks after you fixed the cause: flips them from failed back to deferred, opens one more pass on top of maxPasses (pass history is kept), then resumes the run. Exit 0 when every task is done afterwards, 1 otherwise.'
+  )
+  .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .option('-v, --verbose', 'Stream subagent output to stdout', false)
+  .action(async (ids: string[], opts: { dir: string; verbose: boolean }) => {
+    const projectDir = resolve(opts.dir);
+    const state = await loadState(projectDir);
+    if (!state) {
+      printError(`No state found at ${paths(projectDir).statePath}. Run \`fullauto run <file>\` first.`);
+      process.exitCode = 2;
+      return;
+    }
+    await resetInterrupted(projectDir, state);
+    await reconcileConfigOnResume(projectDir, state);
+    await ensureRunStateIgnored(projectDir);
+    const plan = requeueFailedTasks(state, ids);
+    if (plan.missing.length > 0) {
+      printError(`No such task(s) in this run: ${plan.missing.join(', ')}. Known ids: ${state.tasks.map((t) => t.id).join(', ')}.`);
+      process.exitCode = 2;
+      return;
+    }
+    if (plan.skipped.length > 0) {
+      printWarn(`Not failed, left as is: ${plan.skipped.map((id) => `${id} [${state.tasks.find((t) => t.id === id)?.status}]`).join(', ')}.`);
+    }
+    if (plan.requeued.length === 0) {
+      printInfo('No failed tasks to retry.');
+      process.exitCode = exitCodeForRun(state);
+      return;
+    }
+    printInfo(`Retrying ${plan.requeued.join(', ')}: re-queued as deferred in pass ${state.currentPass} (pass budget now ${retryPassLimit(state)}).`);
+    await saveState(projectDir, state);
+    printResume(paths(projectDir).statePath);
+    const result = await runOrchestrator({ projectDir, state, verbose: opts.verbose });
+    process.exitCode = exitCodeForRun(result);
   });
 
 program
@@ -794,8 +625,70 @@ program
       process.exitCode = 2;
       return;
     }
-    printInfo(`Started: ${state.startedAt}, current pass: ${state.currentPass}`);
+    printInfo(`Started: ${formatKst(state.startedAt)}, current pass: ${state.currentPass}`);
     printFinalReport(state);
+  });
+
+program
+  .command('audit')
+  .description(
+    'Run the deterministic post-task audit over the working tree: orphan code (created but never imported/rendered/mounted), unused exports, test integrity (skip/only, weakened or deleted tests, tautologies) and gate-config integrity. Compares against HEAD (or --base). Exit 1 when any BLOCK is found. This is what the /wiring-audit skill and /verify-loop call as a pre-check.'
+  )
+  .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .option('--base <git-ref>', 'Git ref to diff against instead of HEAD (e.g. main, HEAD~3, a sha)')
+  .option('--json', 'Print the result as JSON instead of a bullet list', false)
+  .action(async (opts: { dir: string; base?: string; json: boolean }) => {
+    const projectDir = resolve(opts.dir);
+    const outcome = await runManualAudit(projectDir, opts.base);
+
+    if (outcome.status === 'not-git-repo') {
+      // Nothing to diff against: the audit is a tree diff. Not an error —
+      // /verify-loop calls this as a pre-check and must keep going.
+      if (opts.json) console.log(JSON.stringify({ skipped: 'not a git repository', blocked: false, findings: [] }, null, 2));
+      else printInfo('Audit skipped: not a git repository.');
+      return;
+    }
+    if (outcome.status === 'base-not-found') {
+      printError(`--base "${outcome.base}" does not resolve to a commit in ${projectDir}.`);
+      process.exitCode = 2;
+      return;
+    }
+    const { base, before, after, result } = outcome;
+
+    const blocks = result.findings.filter((f) => f.severity === 'block').length;
+    const warns = result.findings.filter((f) => f.severity === 'warn').length;
+    if (opts.json) {
+      console.log(
+        JSON.stringify(
+          {
+            base,
+            baseSha: before.headSha,
+            headSha: after.headSha,
+            blocked: result.blocked,
+            counts: { block: blocks, warn: warns, info: result.findings.length - blocks - warns },
+            changed: result.changed,
+            findings: result.findings,
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      printInfo(
+        `Audit: ${result.changed.added} added / ${result.changed.modified} modified / ${result.changed.deleted} deleted vs ${base}${before.headSha ? ` (${before.headSha.slice(0, 7)})` : ''}.`
+      );
+      if (result.findings.length === 0) {
+        console.log(`  (no findings)`);
+      } else {
+        console.log(renderFindings(result.findings));
+      }
+      if (result.blocked) {
+        printError(`Audit BLOCKED: ${blocks} BLOCK / ${warns} WARN.`);
+      } else {
+        printInfo(`Audit passed: 0 BLOCK / ${warns} WARN.`);
+      }
+    }
+    if (result.blocked) process.exitCode = 1;
   });
 
 program
@@ -822,49 +715,24 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
-/**
- * Read tasks file, surface its Manual Prerequisites section, then proceed
- * without prompting. The orchestrator never asks the user "continue?" —
- * the design choice is that runs go through unattended so CI / pipelines
- * / overnight runs don't deadlock at a TTY-only prompt.
- *
- * Behavior:
- *  - No prereqs in the file → silent passthrough, returns true.
- *  - Prereqs present → print the checklist, then return true (proceed).
- *  - `--strict-prereqs` AND missing [ENV] items → return false (refuse to
- *    start). This is the only way the call ever returns false.
- *
- * Missing env vars during the run will surface as gate failures or
- * subagent errors, which the orchestrator's normal defer/retry loop
- * handles. `auto` mode additionally seeds placeholder values and reports
- * them at run end.
- */
-async function surfacePrerequisites(
-  tasksPath: string,
-  opts: { strict: boolean }
-): Promise<boolean> {
-  const prereqs = await loadPrerequisitesFromFile(tasksPath);
-  if (prereqs.length === 0) return true;
-
-  const { missingEnvCount } = printPrerequisites(prereqs);
-
-  if (opts.strict && missingEnvCount > 0) {
-    printError(
-      `--strict-prereqs and ${missingEnvCount} unset env var(s) — refusing to start.`
-    );
-    process.exitCode = 2;
-    return false;
-  }
-
-  if (missingEnvCount > 0) {
-    printWarn(
-      `Proceeding with ${missingEnvCount} unset env var(s) — they will likely surface as gate failures.`
-    );
-  }
-  return true;
-}
-
-program.parseAsync(process.argv).catch((err) => {
-  printError(err instanceof Error ? err.message : String(err));
-  process.exit(1);
+// Ctrl-C / SIGTERM: stop the running subagent's whole process group, let
+// the orchestrator save state at its next checkpoint, exit 130 / 143. A
+// second signal forces the exit (see runner/process-group.ts).
+installSignalHandlers({
+  onSignal: (signal) => {
+    process.stderr.write(`\n[fullauto] ${signal} received — stopping the running subagent and saving state (press again to force).\n`);
+  },
 });
+
+program.parseAsync(process.argv).then(
+  () => {
+    // Commander resolves after the action; process.exitCode carries the verdict.
+  },
+  (err) => {
+    if (err instanceof InterruptedError) {
+      process.exit(err.exitCode);
+    }
+    printError(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+);
