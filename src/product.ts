@@ -552,6 +552,8 @@ export const EvolveRound = z.object({
   /** Feature ids at status `done` in product.md after assess; used by the stall guard. */
   featuresDone: z.array(z.string()).default([]),
   reason: z.string().optional(),
+  /** One line per failed user task (`T003 "title" — first line of the last defer cause`), fed to the NEXT round's planner. */
+  failureNotes: z.array(z.string()).default([]),
 });
 export type EvolveRound = z.infer<typeof EvolveRound>;
 
@@ -573,6 +575,8 @@ export const EvolveState = z.object({
   rounds: z.array(EvolveRound).default([]),
   /** Union of placeholder env names seeded across rounds (reported at the end). */
   placeholderEnvs: z.array(z.string()).default([]),
+  /** Run-wide `/vibe-enhance` budget left after the last finished round; each round's fresh run starts from it instead of resetting to `enhanceBudget`. */
+  enhanceBudgetRemaining: z.number().int().nonnegative().optional(),
   options: EvolveOptions.default({}),
   outcome: EvolveOutcome.optional(),
   finishedAt: z.string().optional(),

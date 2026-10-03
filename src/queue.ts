@@ -26,14 +26,88 @@ function reportedFailedGate(attempt: TaskAttempt): GateResult | undefined {
 }
 
 /**
- * True when the task's two most recent COMPLETED attempts (within the
+ * Run-to-run noise that must not make two identical failures look different:
+ * durations ("in 1.42s", "Duration 121.08s", "(35ms)"), ISO timestamps and
+ * wall-clock times. Counts ("3 failed") are deliberately kept — a changing
+ * count is progress.
+ */
+function normalizeNoise(text: string): string {
+  return text
+    .replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b/g, '<ts>')
+    .replace(/\b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b/g, '<time>')
+    .replace(/\b\d+(?:\.\d+)?\s?(?:ms|s|sec|secs|seconds)\b/g, '<dur>');
+}
+
+/**
+ * What a deterministic failure "looks like" — equal signatures on two
+ * consecutive real attempts mean the retry changed nothing. `undefined` for
+ * failure kinds where a repeat is plausibly flaky or environmental
+ * (`rate_limited`, a non-timeout `subagent_error`) or carries no signal.
+ *
+ *  - `gate_failed`: failing gate + exit code + normalized output.
+ *  - `audit_failed`: the sorted BLOCK set (check, path, message).
+ *  - `verify_loop_blocks_remaining`: the sorted `unmet:` bullets plus the
+ *    `last-attempt:` fix tried — the same gap, the same fix, twice.
+ *  - `tdd_red_expected`: the test counts plus the set of files touched.
+ *  - `subagent_error` that timed out: a timeout is deterministic cost —
+ *    the same prompt under the same limit is the same 60 minutes.
+ */
+function failureSignature(attempt: TaskAttempt): string | undefined {
+  const detail = attempt.deferDetail ?? '';
+  switch (attempt.deferReason) {
+    case 'gate_failed': {
+      const g = reportedFailedGate(attempt);
+      return g ? `gate|${g.name}|${g.exitCode}|${normalizeNoise(g.output)}` : undefined;
+    }
+    case 'audit_failed': {
+      const blocks = (attempt.audit?.findings ?? [])
+        .filter((f) => f.severity === 'block')
+        .map((f) => `${f.check}|${f.path ?? ''}|${f.message}`)
+        .sort();
+      return blocks.length > 0 ? `audit|${blocks.join('\n')}` : undefined;
+    }
+    case 'verify_loop_blocks_remaining': {
+      // `unmet:` bullets are often coarse requirement lines, so the fix the
+      // attempt tried (`last-attempt:`) is part of the identity: a different
+      // attempt against the same bullet is still progress. No `unmet:` at all
+      // (a generic cause) carries no signal.
+      const unmet = [...detail.matchAll(/\bunmet:\s*([^|]+)/g)].map((m) => m[1].trim()).sort();
+      if (unmet.length === 0) return undefined;
+      const tried = [...detail.matchAll(/\blast-attempt:\s*([^|]+)/g)].map((m) => m[1].trim());
+      return `verify|${unmet.join('\n')}|${tried.join('\n')}`;
+    }
+    case 'tdd_red_expected': {
+      // The message is a constant; what distinguishes two attempts is what
+      // they wrote and what the test gate then said.
+      const touched = (attempt.touched ?? []).map((t) => t.path).sort();
+      if (touched.length === 0) return undefined;
+      return `red|${attempt.tdd?.passed ?? ''}|${attempt.tdd?.failing ?? ''}|${touched.join('\n')}`;
+    }
+    case 'subagent_error':
+      return /^Subagent timed out\b/.test(detail) ? 'timeout' : undefined;
+    default:
+      return undefined;
+  }
+}
+
+/** Attempts that actually ran a subagent (not the orchestrator's "still pending at pass end" placeholders). */
+function realCompletedAttempts(task: Task): TaskAttempt[] {
+  const floor = task.baselineResetAtAttempt ?? 0;
+  return task.attempts.filter(
+    (a, i) => i >= floor && a.finishedAt !== undefined && a.deferReason !== 'depends_on_unfinished_task'
+  );
+}
+
+/**
+ * True when the task's two most recent real COMPLETED attempts (within the
  * `baselineResetAtAttempt` window — a `fullauto retry` resets the streak,
- * since a human intervened between them) both deferred on the exact same
- * gate failure: same gate name, same exit code, the same captured output
- * byte-for-byte. Two independent real attempts — the second one given the
- * first one's failure as prior-attempt context in its own prompt — that
- * still produce IDENTICAL gate output is strong evidence a further
- * identical-cost retry will not converge either.
+ * since a human intervened between them) failed in the SAME deterministic
+ * way (`failureSignature`): the same gate with the same output, the same
+ * audit BLOCKs, the same unmet requirement bullets, or a timeout twice.
+ * Two independent real attempts — the second one given the first one's
+ * failure as prior-attempt context in its own prompt — that still produce an
+ * IDENTICAL failure are strong evidence a further identical-cost retry will
+ * not converge either.
  *
  * Why this exists: `maxPasses`'s doc comment (types.ts) reasons that "the
  * no-progress guard makes the extra pass nearly free when nothing's
@@ -41,27 +115,34 @@ function reportedFailedGate(attempt: TaskAttempt): GateResult | undefined {
  * single task stuck this way while every OTHER task keeps converging:
  * `noProgressInCurrentPass` only compares the pass-wide unresolved id SET,
  * so it never notices one task riding along for a full-cost subagent spawn
- * every remaining pass up to `maxPasses` on an outcome the last two
- * attempts already proved will not change. `next()` uses this to stop
- * offering the task up for another attempt; it stays `deferred` and is
- * promoted to `failed` by the normal end-of-run "still unresolved" sweep,
- * same as any task that exhausts `maxPasses` — this only moves that point
- * earlier once the evidence is unambiguous, and only for the one task.
+ * (a high-risk one is an implementer plus a whole reviewer set) every
+ * remaining pass on an outcome the last two attempts already proved will
+ * not change. `next()` uses this to stop offering the task up for another
+ * attempt; it stays `deferred` and is promoted to `failed` by the normal
+ * end-of-run "still unresolved" sweep, same as any task that exhausts
+ * `maxPasses` — this only moves that point earlier once the evidence is
+ * unambiguous, and only for the one task. Placeholder attempts do not count
+ * and do not break the streak. (The name predates the non-gate signatures.)
  */
 export function stuckOnIdenticalGateFailure(task: Task): boolean {
-  const floor = task.baselineResetAtAttempt ?? 0;
-  const completed = task.attempts.filter((a, i) => i >= floor && a.finishedAt !== undefined);
+  const completed = realCompletedAttempts(task);
   if (completed.length < 2) return false;
-  const last = completed[completed.length - 1];
-  const prev = completed[completed.length - 2];
-  const lastGate = reportedFailedGate(last);
-  const prevGate = reportedFailedGate(prev);
-  if (!lastGate || !prevGate) return false;
-  return (
-    lastGate.name === prevGate.name &&
-    lastGate.exitCode === prevGate.exitCode &&
-    lastGate.output === prevGate.output
-  );
+  const last = failureSignature(completed[completed.length - 1]);
+  const prev = failureSignature(completed[completed.length - 2]);
+  return last !== undefined && last === prev;
+}
+
+/**
+ * Optional synthetic passes get fewer real attempts than user tasks: an
+ * ENHANCE pass is a "nice to have" research subagent that spawns its own
+ * nested reviewers, so a failed one is not worth `maxPasses` retries; a
+ * VERIFY pass is a real review of the group, so it gets one retry.
+ */
+const SYNTHETIC_MAX_ATTEMPTS: Partial<Record<Task['kind'], number>> = { enhance: 1, verify: 2 };
+
+export function syntheticAttemptsExhausted(task: Task): boolean {
+  const cap = SYNTHETIC_MAX_ATTEMPTS[task.kind];
+  return cap !== undefined && realCompletedAttempts(task).length >= cap;
 }
 
 export class TaskQueue {
@@ -98,8 +179,10 @@ export class TaskQueue {
    * `finishedAt`, so the task remains eligible — exactly what we want on
    * resume.
    *
-   * Also excludes a task whose last two attempts failed on the exact same
-   * gate (`stuckOnIdenticalGateFailure`) — see that function's doc comment.
+   * Also excludes a task whose last two attempts failed in the exact same
+   * deterministic way (`stuckOnIdenticalGateFailure`) and a synthetic
+   * enhance / verify task past its small attempt cap
+   * (`syntheticAttemptsExhausted`) — see those functions' doc comments.
    * It stays `deferred`, just never offered again; the end-of-run sweep
    * promotes it to `failed` like any other task that runs out of passes.
    *
@@ -117,7 +200,8 @@ export class TaskQueue {
         !t.attempts.some(
           (a) => a.passNumber === currentPass && a.finishedAt !== undefined
         ) &&
-        !stuckOnIdenticalGateFailure(t)
+        !stuckOnIdenticalGateFailure(t) &&
+        !syntheticAttemptsExhausted(t)
     );
   }
 

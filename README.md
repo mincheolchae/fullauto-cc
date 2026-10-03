@@ -85,7 +85,15 @@ audit이 그 증거 줄을 확인합니다.
 종료는 세 가지로 가드됩니다: 모든 task가 `done`/`failed`, `currentPass >
 maxPasses`(기본 4), **무진전 감지**(한 pass가 시작과 동일한 미해결 집합으로
 끝나면 즉시 중단). 남은 `deferred`는 `failed`로 승격되어 리포트에 이유와 함께
-나옵니다.
+나옵니다. 추가로 **같은 task가 같은 방식으로 두 번 연속 실패**하면(같은 게이트 +
+같은 출력(소요 시간 등 노이즈 제외), 같은 audit BLOCK 집합, 같은 `unmet:` 목록,
+또는 timeout 두 번) 그 task는 더 이상 시도하지 않습니다 — 재시도가 prompt에
+이전 실패를 받고도 결과를 못 바꿨다는 증거이기 때문입니다. 합성 `ENHANCE-` task는
+attempt 1회, `VERIFY-` task는 2회로 제한됩니다(선택적 패스에 `maxPasses`를
+쓰지 않음). 서브에이전트가 레이트리밋 backoff(`rateLimitMaxRetries`)를 다
+쓰고도 API가 포화 상태면 run은 **일시정지**(exit 75, state 저장)하고
+`fullauto resume`으로 이어갑니다 — 다음 task가 똑같은 포화 API에 backoff를 또
+소진하며 pass만 태우는 일이 없도록.
 
 ---
 
@@ -101,8 +109,17 @@ npm run build
 npm link            # `fullauto` 명령을 PATH에 등록
 ```
 
+`npm run build`는 끝에 `dist/cli.js`에 실행 권한을 줍니다(`postbuild`) — tsc
+산출물은 실행 비트가 없어 이 단계가 빠지면 `npm link`가 걸려 있어도
+`fullauto: command not found`가 납니다.
+
 전제: Node ≥ 18, `claude` CLI(Claude Code)가 PATH에 (`which claude`), 대상
 프로젝트가 git 저장소(audit은 git 스냅샷 기반 — 커밋은 없어도 됨).
+
+**업데이트**: `git pull && npm install && npm run build`. `npm link`와 아래 2.2의
+심볼릭 링크는 이 디렉토리를 가리키므로 CLI · 슬래시 커맨드 · 스킬이 한 번에
+갱신됩니다(다시 링크할 필요 없음). 확인: `command -v fullauto && fullauto
+--version`, `ls -l ~/.claude/skills/verify-loop`.
 
 ### 2.2 슬래시 커맨드 + 스킬 설치 (권장)
 
@@ -247,6 +264,13 @@ fullauto evolve "..." --force --reshape   # product.md도 폐기 (product.prev.m
 | `time_budget` | `--time-budget` 초과 — **이번 호출 기준**, 단계 사이에서 검사 (resume하면 예산이 새로 시작) | 0 |
 | `aborted` | shape 2회 실패, planner 2회 실패, 게이트 없음 등 | 1 |
 
+**라운드 간에 넘어가는 것**: 직전 라운드에서 failed된 task는 `T003 "제목" —
+<defer 사유>: <원인 첫 줄>` 한 줄씩 다음 라운드 planner prompt에 들어가
+("같은 방식으로 다시 계획하지 말고 더 잘게 쪼개거나 접근을 바꿔라"), 남은
+`enhanceBudget`은 라운드마다 3으로 리셋되지 않고 run 전체 예산으로 이어집니다
+(`evolve-state.json`의 `enhanceBudgetRemaining`, 라운드의 `failureNotes`). assess
+단계가 timeout 나면 재시도는 2배 시간으로 돕니다(같은 제한이면 같은 timeout).
+
 resume 시 `--rounds`를 더 크게 주면 이미 `max_rounds`로 끝난 evolve를 연장할 수
 있습니다. `ship`/`stop`으로 끝난 evolve는 그 판정이 유지되며 `--force`로만
 다시 시작합니다.
@@ -260,7 +284,8 @@ resume 시 `--rounds`를 더 크게 주면 이미 `max_rounds`로 끝난 evolve�
 fit으로 점수화하고 **run 전체 예산**(`enhanceBudget`, 기본 3; LARGE ≤ 1, 새
 라이브러리 DEP ≤ 1) 안에서 적용한 뒤 `/verify-loop`로 검증합니다. 적용 수는
 `FULLAUTO_ENHANCE: applied=<n> optional=<n> promote=<F ids|none>` 줄로
-오케스트레이터가 차감하고, `product.md`가 있으면 backlog와 중복되는 후보는
+오케스트레이터가 차감하고(**트리에 남은 추가만** — 롤백된 enhance attempt는
+예산을 쓰지 않음), `product.md`가 있으면 backlog와 중복되는 후보는
 적용 대신 `promote=`로 넘겨 다음 라운드 planner가 가져갑니다. "추가할 게
 없으면 그냥 통과"가 스킬에 박힌 룰입니다.
 
@@ -319,6 +344,14 @@ status / JSON shape 불일치, 언어가 다른 monorepo의 반대쪽, 테스트
 실제 비즈니스 endpoint는 사용자가 추가해야 합니다 — 예시는
 [7.2](#72-게이트-예시).
 
+**시작 전 baseline 점검** (`baselineCheck`, 기본 `abort`): 새 run은 첫 task
+전에 게이트를 한 번 돌립니다. 이미 빨간 게이트(의존성 미설치, 기존 타입 에러,
+깨진 테스트)는 모든 task를 똑같이 실패시켜 task 수 × 재시도만큼 구현
+서브에이전트를 헛돌리므로, shell `typecheck` / `test` / `lint` / `build` 게이트가
+빨가면 어떤 서브에이전트도 띄우기 전에 실패한 게이트의 출력 꼬리와 함께 중단합니다
+(고친 뒤 `fullauto resume`). `http` / `convex-fn` / `e2e` 게이트는 run이 지금 만들 것을
+두드릴 수 있어서 경고만 합니다. 이미 attempt가 있는 run(resume)에서는 건너뜁니다.
+
 ### 4.2 검증 모드와 비용
 
 `verifyMode`(또는 `--verify <mode>`)가 task별로 서브에이전트에 지시할
@@ -336,14 +369,27 @@ status / JSON shape 불일치, 언어가 다른 monorepo의 반대쪽, 테스트
 |---|---|---|---|
 | `gates` | 0 (self-review 한 번; `/verify-loop` 호출 금지) | — | 0 |
 | `light` | 2 — code(correctness + security + integration, diff 범위) + requirements | BLOCK을 낸 차원만 | 4 |
-| `full` | 4 — correctness · security · requirements · integration (+ UI / public API 변경 시 design) | BLOCK을 낸 차원만 | 8 (design 포함 10) |
+| `full` | 3 — correctness(wiring 포함) · security · requirements (+ UI / public API 변경 시 design) | BLOCK을 낸 차원만 | 6 (design 포함 8) |
 
 예: 10 task 중 config/test 3, medium 5, high 2를 `adaptive`로 돌리면 리뷰어
-spawn은 최소 18, 최악 36 (구버전 "모든 task 3 사이클 × 4 리뷰어"의 최악 120
-대비). risk=high 키워드: `auth login logout password token session oauth jwt
-payment billing stripe checkout webhook migration schema permission rbac role
-secret crypto encrypt upload middleware security admin delete destroy public
-api rate-limit`. `light` / `full`인데 `VERIFY_LOOP_RESULT:` 줄이 없거나 더 낮은
+spawn은 최소 16, 최악 32 (구버전 "모든 task 3 사이클 × 4 리뷰어"의 최악 120
+대비). risk=high 키워드는 두 단계입니다 — 제목 + 본문에서 보는 강한 키워드:
+`auth login password oauth jwt payment billing stripe checkout webhook
+migration permission rbac secret crypto encrypt security public api`; **제목에서만**
+보는 약한 키워드: `logout token session schema role upload middleware admin
+delete destroy rate-limit` (본문 acceptance bullet에 "delete returns 204" 같은
+말이 있다고 일반 CRUD가 `full`이 되지 않도록). 제목이 평범한데 위험하면
+`- risk: high` 마커를 쓰세요.
+
+**재시도는 리뷰를 되풀이하지 않습니다.** 이전 attempt가 `VERIFY_LOOP_RESULT:`
+영수증에서 `block=0`으로 요구 깊이를 이미 통과했고 defer 사유가 결정적 실패
+(`gate_failed` / `audit_failed` / `tdd_red_expected`)면, 재시도는 `gates`로
+내려갑니다 — 고칠 대상(실패한 assertion, 안 붙은 import)을 다음 게이트 / audit이
+무료로 검증하기 때문입니다. (`/verify-loop` 자체도 fullauto 안에서는 사이클 1에 typecheck → test만 돌리고
+lint는 건너뛰며, 사이클 2+는 수정이 건드린 테스트 파일만 다시 돌립니다 —
+오케스트레이터가 종료 직후 모든 게이트를 어차피 다시 돌리기 때문입니다.) 영수증이 없거나(`verify-evidence` BLOCK 포함) 리뷰어
+자신이 defer시킨 경우(`verify_loop_blocks_remaining`)는 깊이를 유지하고,
+`verifyMode: full`은 그대로 존중합니다. `light` / `full`인데 `VERIFY_LOOP_RESULT:` 줄이 없거나 더 낮은
 깊이로 돌린 흔적이면 `verify-evidence` audit이 BLOCK합니다.
 
 ### 4.3 결정적 audit
@@ -452,6 +498,16 @@ state.redTests += T003   state.redTests −= T003
   `gate_failed` 연쇄로 끌어내리지 않게 하기 위함이고, 다음 attempt의 prompt에는
   "이전 변경은 롤백됨, patch는 여기 — 맞았던 부분은 `git apply --3way`로
   되살려라"가 들어갑니다. git 저장소가 아니면 롤백은 건너뛰고 경고합니다.
+- **additive-only audit 실패는 patch를 자동 재적용** — 게이트는 통과했고 audit
+  BLOCK이 전부 "빠진 것" 계열(`orphan-code` · `unused-export` ·
+  `wiring-manifest` · `pending-wiring` · `verify-evidence` · `test-count`)이면,
+  다음 attempt를 띄우기 전에 오케스트레이터가 저장된 patch를 `git apply`(전부
+  아니면 전무)로 되돌려놓고 prompt에 "재구현하지 말고 빠진 것만 채워라"를
+  넣습니다. 맞는 작업을 통째로 다시 짜는 비용을 없애는 장치입니다. 치팅성 실패
+  (`test-integrity` · `gate-integrity` · `tdd-*`)는 재적용 없이 롤백된 채
+  재시도하고, patch가 깔끔히 안 들어가면 위의 일반 안내로 폴백합니다. 롤백
+  기준(baseline)은 재적용 이전에 잡으므로 이 attempt가 다시 defer돼도 정확히 task
+  시작 시점으로 복원됩니다.
 - **재시도** — pass 루프 안에서는 자동. run이 끝난 뒤 `failed`로 남은 task는
   원인을 고치고 `fullauto retry [T007 T009]`(ID 생략 = 모든 failed)로
   `deferred`로 되돌려 이어서 돌립니다. pass 기록은 유지되고(pass 1로 리셋하지
@@ -462,6 +518,12 @@ state.redTests += T003   state.redTests −= T003
   누르면 강제 종료) 상태를 저장한 뒤 130 / 143으로 나갑니다. 그 attempt는
   `interrupted by signal (<signal>)`로 기록되고 다음 `resume` / `retry`에서
   재큐잉됩니다.
+- **레이트리밋 일시정지 (exit 75)** — 서브에이전트가 backoff 재시도
+  (`rateLimitMaxRetries`)를 다 쓰고도 API가 포화면 run은 그 attempt를 미완료로
+  둔 채 상태를 저장하고 75로 나갑니다(evolve도 동일). 사용량 창이 리셋된 뒤
+  `fullauto resume` — pass를 소모하지 않고 그 task부터 재개됩니다. timeout된
+  spawn은 레이트리밋으로 보지 않고, 같은 task가 두 번 연속 일시정지시키면
+  일반 defer(`rate_limited`)로 처리합니다.
 
 ### 4.7 `fullauto audit` — 독립 실행
 
@@ -490,7 +552,7 @@ pre-check, 서브에이전트의 마무리 자가 점검(prompt 룰 6)이 이 �
 
 | 스킬 | 무엇을 | fullauto가 자동 호출하는 시점 | 수동 호출 | 남기는 기계 줄 |
 |---|---|---|---|---|
-| **`/verify-loop`** | 게이트 → `fullauto audit` → 깊이에 맞는 fresh 리뷰어 병렬 spawn(`gates` 0 / `light` 2 / `full` 4+design) → BLOCK 수정 → **BLOCK을 낸 차원만** 재리뷰, `cycles`(기본 2)까지. integration 리뷰어가 `FULLAUTO_WIRING` 주장을 한 줄씩 대조, requirements 리뷰어가 테스트가 진짜 unit을 호출하는지 검사 | 모든 impl task의 prompt에 `Verification depth: <d>`로 박힘 (`gates`면 호출 금지) | `/verify-loop depth=gates\|light\|full cycles=N` — 인자 없으면 diff 크기 · 위험 키워드로 추론 | `VERIFY_LOOP_RESULT: depth=<d> cycles=<n> block=<n> warn=<n>`; cap 후 BLOCK 잔존 시 `FULLAUTO_RESULT: DEFER … \| unmet: … \| warn: … \| last-attempt: …` |
+| **`/verify-loop`** | 게이트 → `fullauto audit` → 깊이에 맞는 fresh 리뷰어 병렬 spawn(`gates` 0 / `light` 2 / `full` 3+design) → BLOCK 수정 → **BLOCK을 낸 차원만** 재리뷰, `cycles`(기본 2)까지. correctness 리뷰어의 wiring 렌즈가 `FULLAUTO_WIRING` 주장을 한 줄씩 대조(orphan / entrypoint는 `fullauto audit`이 이미 결정적으로 판정), requirements 리뷰어가 테스트가 진짜 unit을 호출하는지 검사 | 모든 impl task의 prompt에 `Verification depth: <d>`로 박힘 (`gates`면 호출 금지) | `/verify-loop depth=gates\|light\|full cycles=N` — 인자 없으면 diff 크기 · 위험 키워드로 추론 | `VERIFY_LOOP_RESULT: depth=<d> cycles=<n> block=<n> warn=<n>`; cap 후 BLOCK 잔존 시 `FULLAUTO_RESULT: DEFER … \| unmet: … \| warn: … \| last-attempt: …` |
 | **`/tdd-loop`** | 실패하는 테스트 먼저 → **실제로 돌려 실패 요약 줄 붙여넣기** → 최소 구현 → 통과 확인 → green에서 리팩토링. 러너 자동 감지(vitest / jest / mocha / node:test / pytest / go / cargo / playwright / cypress), 테스트 레벨 선택(순수 로직 unit, I/O 경계 integration, endpoint / CLI / journey는 진짜 entry point e2e) | 모든 behavior task(`mode=single`), red task(`mode=red`), green task(`mode=green`) | "TDD로", "테스트 먼저", `/tdd-loop` | `FULLAUTO_TDD: red=<n failing> green=<n passing>`; green 모드에서 `FULLAUTO_TEST_CHANGE: <file> — <reason>` |
 | **`/wiring-audit`** | `fullauto`가 PATH에 있으면 `fullauto audit --base <ref>`, 없으면 `git diff` → artifact마다 `git grep`으로 production consumer 탐색 → `artifact \| consumer \| status` 표. entrypoint 면제 목록을 앎. `fix`는 orphan을 엮거나 삭제, `report`는 표만 | `/verify-loop` pre-check 경로 | "연결됐나", "orphan", "dead code", `/wiring-audit [base=<ref>] [fix\|report]`; PR 전이나 `audit_failed` 진단 | (없음 — `fullauto audit`의 출력) |
 | **`/vibe-enhance`** | 세 축(table-stakes → UX → trend)으로 후보 수집, impact × fit / effort 점수화, 예산 안에서 적용(`FIT-BREAK` / `ENHANCE:S` / `ENHANCE:L` / `ENHANCE:DEP`), 나머지는 OPTIONAL, backlog 중복은 `PROMOTE F00x`. 적용분은 wiring + 테스트 + `/verify-loop`. no-op도 valid | `--vibe-enhance` 시 기능 그룹마다 (`mode=post budget=<remaining>`); `/product-shape`가 brownfield에서 `mode=pre`로 | "트렌드", "관례", "table stakes", "한 단계 위로", `/vibe-enhance [mode=pre\|post] [budget=<n>[/<large>/<dep>]]` | `FULLAUTO_ENHANCE: applied=<n> optional=<n> promote=<F ids\|none>` |
@@ -605,7 +667,8 @@ planner를 오염시키지 않도록. 전체 예시는
 | `useVerifyLoop` | `true` | 구버전 스위치. `false`면 `verifyMode: gates-only`와 동일 (`--verify`가 주어지면 이 run에서는 다시 켬) |
 | `audit` | 모두 `true` | `{ enabled, orphanCheck, unusedExportCheck, wiringManifest, testIntegrity, gateIntegrity, testCount, tdd }` — [4.3](#43-결정적-audit). 프로젝트가 구조적으로 만족 못 할 때만 끔 (예: 파일명으로 플러그인을 탐색하는 repo의 `orphanCheck`) |
 | `vibeEnhance` | `false` | 기능 그룹마다 `/vibe-enhance` 패스 (`--vibe-enhance`로 켜기만 가능, 끄는 건 config에서) |
-| `enhanceBudget` | `3` | run 전체에서 vibe-enhance가 적용할 수 있는 추가 수 |
+| `enhanceBudget` | `3` | run 전체에서 vibe-enhance가 적용할 수 있는 추가 수 (evolve에서는 라운드 간 이월) |
+| `baselineCheck` | `"abort"` | 새 run의 첫 task 전에 게이트를 **한 번** 돌려 이미 빨간 게이트를 잡음 — [4.1](#41-게이트--세-타입-세-레이어). `abort` = shell typecheck / test / lint / build 게이트가 빨가면 spawn 0회로 중단; `warn` = 보고만; `off` = 건너뜀 |
 | `rollbackOnDefer` | `true` | defer된 attempt의 변경을 patch로 저장하고 트리를 복원 — [4.6](#46-defer-시-롤백과-재시도) |
 | `services` | `[]` | run 시작 시 띄우는 백그라운드 프로세스 — [7.3](#73-services) |
 | `gates` | `[]` | task마다 실행하는 검증 게이트 — **빈 배열이면 시작 거부**. 정말 게이트 없이 돌리려면 `{"name": "noop", "command": "true"}` |
@@ -861,6 +924,7 @@ outcome + 이유, backlog 상위 10개, `product.md` · `rounds/` 경로, Timing
 | 자동 추론된 결정이 의도와 다름 | `.fullauto/auto-tasks.md` 하단 `## Assumptions` 확인 → 파일 편집 후 `fullauto run .fullauto/auto-tasks.md` |
 | 서브에이전트 timeout (기본 60분) | `subagentTimeoutSec` 상향 또는 task를 더 잘게. 게이트는 `gates[].timeoutSec`(shell 30분, http / convex-fn 60초) |
 | 같은 task가 deferred만 반복 → failed | `.fullauto/logs/T###-attempt*.log`와 `.patch`로 근본 원인 수정 후 `fullauto retry T###`. `maxPasses` 5+가 도움될 수도 |
+| exit 75, "Run paused — … still rate-limited" | 사용량 한도 포화. 리셋 시각 이후 `fullauto resume` (task는 pass 소모 없이 재개) |
 | `claude` 명령 못 찾음 (`subagent_error`) | PATH에 `claude` CLI 추가 |
 | `/verify-loop`가 안 돈다는 의심 | (1) `~/.claude/skills/verify-loop/SKILL.md` 존재 확인. (2) `adaptive`에서 config / docs / test / low-risk는 **의도적으로** `gates`. 로그의 `Verification depth:` / `VERIFY_LOOP_RESULT:` 줄로 확인, 전부 돌리려면 `--verify full` |
 | `audit_failed` — `verify-evidence` "no VERIFY_LOOP_RESULT line" | implementer가 `/verify-loop`를 건너뛰었거나 증거 줄을 안 남김. 스킬 설치 확인; 스킬이 있어도 반복되면 로그에서 depth 지시가 prompt에 있는지 확인 |

@@ -299,3 +299,17 @@ export async function rollbackToTree(projectDir: string, baselineTree: string, p
   }
   return result;
 }
+
+/**
+ * Re-apply a saved attempt patch onto the (rolled-back) working tree. All or
+ * nothing: `git apply` without `--3way` / `--reject` either lands every hunk
+ * or touches nothing, so a conflict leaves the tree exactly as it was and the
+ * caller falls back to telling the subagent to apply the patch by hand.
+ * Runs from the repo top level because the patch carries repo-root paths.
+ */
+export async function reapplyPatch(projectDir: string, patchPath: string): Promise<boolean> {
+  const top = await gitEnv(projectDir, ['rev-parse', '--show-toplevel']);
+  if (top.code !== 0) return false;
+  const res = await gitEnv(top.stdout.trim(), ['apply', '--whitespace=nowarn', patchPath]);
+  return res.code === 0;
+}

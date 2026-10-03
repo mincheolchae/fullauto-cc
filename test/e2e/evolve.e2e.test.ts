@@ -452,3 +452,59 @@ describe('(g) existing product.md, --force --reshape', () => {
     expect(await fake.prompts()).toEqual([]);
   }, 60_000);
 });
+
+describe('(h) what round N learned reaches round N+1', () => {
+  it('failed-task reasons go to the next planner; the enhance budget is carried, not reset', async () => {
+    const brief = await fixture('product.md', VALID_BRIEF);
+    const briefR1 = await fixture('product-r1.md', BRIEF_AFTER_ROUND_1);
+    const r1 = await fixture(
+      'tasks-r1-fail.md',
+      [
+        '<!-- fullauto:round=1 items=F001,F002 -->',
+        '## Feature: F001 Create and edit a note',
+        '- [ ] T001 Create the note module',
+        'FAKE: write src/note.ts',
+        '## Feature: F002 Search notes',
+        '- [ ] T002 Create the search module',
+        'FAKE: defer because the search index service is unreachable',
+        PREREQS,
+      ].join('\n')
+    );
+    const r2 = await fixture('tasks-r2.md', TASKS_R2);
+    await fake.script(SHAPE_PROMPT_TITLE, `FAKE: copyfile ${brief} .fullauto/product.md`);
+    await fake.script(
+      PLAN_TITLE,
+      [`FAKE: nth plan 1 copyfile ${r1} .fullauto/rounds/1/tasks.md`, `FAKE: nth plan 2 copyfile ${r2} .fullauto/rounds/2/tasks.md`].join('\n')
+    );
+    // Every enhance pass applies 2 additions: with a budget of 3, round 1's pass leaves 1 for round 2.
+    await fake.script('# vibe-enhance pass', 'FAKE: echo FULLAUTO_ENHANCE: applied=2 optional=0 promote=none');
+    await fake.script(
+      ASSESS_PROMPT_TITLE,
+      [
+        `FAKE: nth assess 1 copyfile ${briefR1} .fullauto/product.md`,
+        'FAKE: nth assess 1 echo FULLAUTO_ASSESS: verdict=continue score=40 next=F003 reason=search blocked',
+        'FAKE: nth assess 2 echo FULLAUTO_ASSESS: verdict=ship score=90 next=none reason=done',
+      ].join('\n')
+    );
+
+    const { state } = await evolve({ rounds: 3, vibeEnhance: true });
+
+    expect(state.rounds[0].tasksDone).toBe(1);
+    expect(state.rounds[0].tasksFailed).toBe(1);
+    expect(state.rounds[0].failureNotes).toHaveLength(1);
+    expect(state.rounds[0].failureNotes[0]).toMatch(/^T002 "Create the search module" — .*: .*unreachable/);
+
+    const prompts = await fake.prompts();
+    const plan2 = prompts.filter((p) => h1(p) === PLAN_TITLE)[1];
+    expect(plan2).toContain('FAILED last round');
+    expect(plan2).toContain('T002 "Create the search module"');
+    expect(plan2).toContain('unreachable');
+
+    // Round 1 spent 2 of the 3-addition budget; round 2's enhance pass is told 1 is left.
+    const enhancePrompts = prompts.filter((p) => h1(p) === '# vibe-enhance pass');
+    expect(enhancePrompts.length).toBeGreaterThanOrEqual(2);
+    expect(enhancePrompts[0]).toContain('budget=3');
+    expect(enhancePrompts[enhancePrompts.length - 1]).toContain('budget=1');
+    expect(state.enhanceBudgetRemaining).toBe(0); // round 2's pass applied 2 more, clamped at 0
+  }, 90_000);
+});

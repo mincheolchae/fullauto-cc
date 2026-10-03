@@ -6,8 +6,10 @@ import {
   parseTaskMarkers,
   canonicalTaskId,
   describeClassification,
+  priorCleanReview,
 } from '../src/task-class.js';
-import { RunConfig, type Task } from '../src/types.js';
+import { RunConfig, type Task, type TaskAttempt } from '../src/types.js';
+import { makeAttempt } from './helpers/fixtures.js';
 
 function task(id: string, title: string, body = '', extra: Partial<Task> = {}): Task {
   return {
@@ -167,6 +169,21 @@ describe('classifyTask — risk', () => {
     expect(cls.rationale.some((r) => /risk=high \(heuristic: matched "(session|jwt)"\)/.test(r))).toBe(true);
   });
 
+  it('weak keywords (role, delete, token, schema, session, admin …) count in the TITLE only', () => {
+    // Acceptance detail in the body must not turn ordinary CRUD into a 4-reviewer task.
+    const crud = task('T1', 'Implement item service', '- delete returns 204\n- validates the schema\n- role badge shown');
+    expect(classifyTask(crud, [crud]).risk).toBe('medium');
+    const delTitle = task('T2', 'Implement DELETE /items/:id endpoint');
+    expect(classifyTask(delTitle, [delTitle]).risk).toBe('high');
+  });
+
+  it('strong keywords (auth, payment, migration, secret …) count in title AND body', () => {
+    const t = task('T1', 'Implement profile page', '- calls the payment provider on save');
+    const cls = classifyTask(t, [t]);
+    expect(cls.risk).toBe('high');
+    expect(cls.rationale.some((r) => r.includes('matched "payment"'))).toBe(true);
+  });
+
   it('config/docs default to low, typo/rename titles are low, everything else medium', () => {
     expect(classifyTask(task('T1', 'Install prettier'), []).risk).toBe('low');
     expect(classifyTask(task('T1', 'Fix typo in error message'), []).risk).toBe('low');
@@ -299,6 +316,57 @@ describe('depthFor / effectiveVerifyMode', () => {
     expect(effectiveVerifyMode(cfg({ useVerifyLoop: false, verifyMode: 'full' }))).toBe('gates-only');
     expect(depthFor(cls('impl', 'high'), cfg({ useVerifyLoop: false, verifyMode: 'full' }))).toBe('gates');
     expect(effectiveVerifyMode(cfg())).toBe('adaptive');
+  });
+
+  describe('retry downshift (priorCleanReview)', () => {
+    const attempt = (over: Partial<TaskAttempt>): TaskAttempt =>
+      makeAttempt(1, { finishedAt: new Date().toISOString(), ...over });
+    const reviewed = (reason: TaskAttempt['deferReason'], loop: TaskAttempt['verifyLoop']) =>
+      attempt({ deferReason: reason, verifyLoop: loop });
+    const high = cls('impl', 'high');
+
+    it('clean review + deterministic defer → the retry is gates', () => {
+      for (const reason of ['gate_failed', 'audit_failed', 'tdd_red_expected'] as const) {
+        const t = { attempts: [reviewed(reason, { depth: 'full', cycles: 1, block: 0, warn: 0 })] };
+        expect(depthFor(high, cfg(), t)).toBe('gates');
+      }
+      const medium = { attempts: [reviewed('gate_failed', { depth: 'light', block: 0 })] };
+      expect(depthFor(cls('impl', 'medium'), cfg(), medium)).toBe('gates');
+    });
+
+    it('a review at a LOWER depth than required does not count', () => {
+      const t = { attempts: [reviewed('gate_failed', { depth: 'light', block: 0 })] };
+      expect(depthFor(high, cfg(), t)).toBe('full');
+    });
+
+    it('no receipt, unresolved BLOCKs, or reviewer-originated defers keep the depth', () => {
+      expect(depthFor(high, cfg(), { attempts: [reviewed('audit_failed', undefined)] })).toBe('full');
+      expect(depthFor(high, cfg(), { attempts: [reviewed('gate_failed', { depth: 'full', block: 2 })] })).toBe('full');
+      expect(depthFor(high, cfg(), { attempts: [reviewed('verify_loop_blocks_remaining', { depth: 'full', block: 0 })] })).toBe('full');
+      expect(depthFor(high, cfg(), { attempts: [reviewed('subagent_error', { depth: 'full', block: 0 })] })).toBe('full');
+    });
+
+    it('only the LAST real attempt decides the defer kind; the in-flight attempt and placeholders are ignored', () => {
+      const t = {
+        attempts: [
+          reviewed('gate_failed', { depth: 'full', block: 0 }),
+          attempt({ deferReason: 'depends_on_unfinished_task' }),
+          makeAttempt(2), // in flight: no finishedAt
+        ],
+      };
+      expect(depthFor(high, cfg(), t)).toBe('gates');
+      const afterVerifyDefer = {
+        attempts: [reviewed('gate_failed', { depth: 'full', block: 0 }), reviewed('verify_loop_blocks_remaining', { depth: 'full', block: 1 })],
+      };
+      expect(depthFor(high, cfg(), afterVerifyDefer)).toBe('full');
+    });
+
+    it('verifyMode full is explicit and is never downshifted; a fullauto retry (baselineResetAtAttempt) forgets the history', () => {
+      const t = { attempts: [reviewed('gate_failed', { depth: 'full', block: 0 })] };
+      expect(depthFor(high, cfg({ verifyMode: 'full' }), t)).toBe('full');
+      expect(depthFor(high, cfg(), { ...t, baselineResetAtAttempt: 1 })).toBe('full');
+      expect(priorCleanReview(t, 'gates')).toBeUndefined();
+    });
   });
 
   it('describeClassification is a compact one-liner', () => {

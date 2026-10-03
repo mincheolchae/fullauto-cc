@@ -32,11 +32,31 @@ let shutdown: ShutdownSignal | undefined;
 
 /** Thrown by `throwIfInterrupted` once a shutdown signal was received. */
 export class InterruptedError extends Error {
-  readonly exitCode: number;
-  constructor(readonly signal: ShutdownSignal) {
-    super(`interrupted by ${signal}`);
+  exitCode: number;
+  constructor(readonly signal: ShutdownSignal, message = `interrupted by ${signal}`) {
+    super(message);
     this.name = 'InterruptedError';
     this.exitCode = SHUTDOWN_EXIT_CODES[signal];
+  }
+}
+
+/** `EX_TEMPFAIL` (sysexits.h): "try again later" — what a rate-limit pause exits with. */
+export const RATE_LIMIT_PAUSE_EXIT_CODE = 75;
+
+/**
+ * The API is still saturated after a spawn used up every backoff retry. The
+ * run stops here instead of deferring the task and moving on: the next task
+ * would spend its own full backoff budget against the same saturated API,
+ * and every task would then burn passes without ever having been tried. It
+ * rides the `InterruptedError` path — state saved, the in-flight attempt
+ * left unfinished so `fullauto resume` retries it for free (no pass is
+ * charged) — only the exit code and message differ.
+ */
+export class RateLimitPausedError extends InterruptedError {
+  constructor(readonly detail: string) {
+    super('SIGTERM', `paused: ${detail}`);
+    this.name = 'RateLimitPausedError';
+    this.exitCode = RATE_LIMIT_PAUSE_EXIT_CODE;
   }
 }
 

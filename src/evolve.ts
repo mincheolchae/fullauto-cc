@@ -16,7 +16,7 @@ import {
 import { buildAssessPrompt, buildShapePrompt } from './evolve-prompts.js';
 import { spawnClaudeWithBackoff } from './runner/claude.js';
 import { DEFAULT_RATE_LIMIT_BACKOFF } from './runner/rate-limit.js';
-import { InterruptedError, throwIfInterrupted } from './runner/process-group.js';
+import { InterruptedError, RateLimitPausedError, throwIfInterrupted } from './runner/process-group.js';
 import { runOrchestrator } from './orchestrator.js';
 import {
   applyVerifyOverride,
@@ -214,7 +214,11 @@ export async function runEvolve(opts: EvolveOptions): Promise<EvolveResult> {
       // `fullauto run` does), so a plain `fullauto evolve` picks it up. Not
       // an outcome — nothing about the product was decided.
       await saveEvolveState(projectDir, state);
-      printWarn(`Evolve interrupted by ${err.signal} during round ${state.round} — resume with \`fullauto evolve\`.`);
+      printWarn(
+        err instanceof RateLimitPausedError
+          ? `Evolve paused during round ${state.round} (API still rate-limited) — resume with \`fullauto evolve\` once the usage window resets.`
+          : `Evolve interrupted by ${err.signal} during round ${state.round} — resume with \`fullauto evolve\`.`
+      );
       throw err;
     }
     if (err instanceof EvolveAbort) {
@@ -395,6 +399,7 @@ async function openRound(state: EvolveState, projectDir: string): Promise<Evolve
     tasksDone: 0,
     tasksFailed: 0,
     backlogItems: [],
+    failureNotes: [],
     nextItems: [],
     featuresDone: [],
   };
@@ -517,6 +522,13 @@ async function planStage(ctx: StageContext, state: EvolveState, rec: EvolveRound
   printInfo(`Round ${rec.round} plan: ${userTasks} task(s)${rec.backlogItems.length ? ` covering ${rec.backlogItems.join(', ')}` : ''}.`);
 }
 
+/** `T003 "title" — first line of why its last attempt failed`, capped; what the next round's planner needs to avoid repeating it. */
+export function failureNote(t: RunState['tasks'][number]): string {
+  const real = [...t.attempts].reverse().find((a) => a.deferDetail && !a.deferDetail.startsWith('Promoted to failed'));
+  const why = (real?.deferDetail ?? 'never reached a terminal state').split('\n').find((l) => l.trim()) ?? '';
+  return `${t.id} "${t.title.slice(0, 80)}" — ${real?.deferReason ?? 'unknown'}: ${why.trim().slice(0, 160)}`;
+}
+
 /** The planner's "User request" for a round: the concept plus what this round is. */
 function roundDescription(state: EvolveState, round: number): string {
   const prev = state.rounds.filter((r) => r.round < round && r.stage === 'done');
@@ -524,9 +536,12 @@ function roundDescription(state: EvolveState, round: number): string {
   const lastLine = last
     ? ` Round ${last.round} finished with ${last.tasksDone} done / ${last.tasksFailed} failed${last.score !== undefined ? `, assessment score ${last.score}` : ''}${last.nextItems.length ? `; the assessor asked for ${last.nextItems.join(', ')} next` : ''}.`
     : '';
+  const failed = last?.failureNotes?.length
+    ? ` These tasks FAILED last round — do not re-plan them the same way; split them smaller, change the approach, or plan around the blocker: ${last.failureNotes.join(' | ')}.`
+    : '';
   return (
     `Evolve the product described by this concept: "${state.concept}". ` +
-    `This is round ${round} of at most ${state.maxRounds}: select the next backlog items from the product brief (see "Product context") and decompose them into tasks that leave each selected item fully usable.${lastLine}`
+    `This is round ${round} of at most ${state.maxRounds}: select the next backlog items from the product brief (see "Product context") and decompose them into tasks that leave each selected item fully usable.${lastLine}${failed}`
   );
 }
 
@@ -565,6 +580,7 @@ async function runStage(ctx: StageContext, state: EvolveState, rec: EvolveRound)
       autoMode: true,
       vibeEnhance: state.options.vibeEnhance,
       verifyMode: state.options.verifyMode,
+      enhanceBudgetRemaining: state.enhanceBudgetRemaining,
       commandStartedAt: rec.startedAt,
     });
     if (!runState) {
@@ -575,6 +591,10 @@ async function runStage(ctx: StageContext, state: EvolveState, rec: EvolveRound)
   const user = runState.tasks.filter((t) => t.kind === 'user');
   rec.tasksDone = user.filter((t) => t.status === 'done').length;
   rec.tasksFailed = user.filter((t) => t.status === 'failed').length;
+  rec.failureNotes = user.filter((t) => t.status === 'failed').map(failureNote);
+  // The enhance budget is run-wide ("bounds scope creep on long unattended
+  // runs"): carry what is left into the next round's fresh run.
+  if (runState.enhanceBudgetRemaining !== undefined) state.enhanceBudgetRemaining = runState.enhanceBudgetRemaining;
   for (const name of runState.placeholderEnvs ?? []) {
     if (!state.placeholderEnvs.includes(name)) state.placeholderEnvs.push(name);
   }
@@ -603,13 +623,17 @@ async function assessStage(ctx: StageContext, state: EvolveState, rec: EvolveRou
 
   let stdout = '';
   let processFailed = false;
+  // A retry of a TIMED-OUT assessor with the same prompt and the same limit is
+  // a guaranteed second timeout (a whole `claude -p` run for nothing), so the
+  // retry after a timeout gets double the room; a plain crash retries as-is.
+  let timeoutSec = ctx.evolveStageTimeoutSec;
   for (let attempt = 1; attempt <= 2; attempt++) {
     printInfo(`Assessing round ${rec.round}${attempt > 1 ? ' (retry)' : ''}.`);
     const res = await spawnClaudeWithBackoff(
       {
         prompt,
         projectDir,
-        timeoutSec: ctx.evolveStageTimeoutSec,
+        timeoutSec,
         mcpConfigPath: ctx.mcpConfigPath,
         logPath: join(roundDir, `assess-attempt${attempt}.log`),
         logHeader: [`# Evolve assess stage — round ${rec.round} (attempt ${attempt})`],
@@ -622,7 +646,8 @@ async function assessStage(ctx: StageContext, state: EvolveState, rec: EvolveRou
     stdout = res.stdout;
     processFailed = res.timedOut || res.exitCode !== 0;
     if (!processFailed) break;
-    printWarn(`Assessor ${res.timedOut ? `timed out after ${ctx.evolveStageTimeoutSec}s` : `exited with code ${res.exitCode}`}.`);
+    printWarn(`Assessor ${res.timedOut ? `timed out after ${timeoutSec}s` : `exited with code ${res.exitCode}`}.`);
+    if (res.timedOut) timeoutSec *= 2;
     await restoreIfBroken(p.productPath, backup);
   }
 

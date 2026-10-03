@@ -1,6 +1,6 @@
 ---
 name: verify-loop
-description: Verified implementation loop with adaptive depth — runs the project gates and `fullauto audit` (orphans, unwired components, skipped / weakened tests, edited gate config) BEFORE any LLM review, then spawns fresh-context reviewers sized to the change — `gates` (none), `light` (code + requirements), `full` (correctness, security, requirements, integration, + design for UI / public API); fixes BLOCKs, re-reviews only their dimensions, ends with `VERIFY_LOOP_RESULT:`. TRIGGER — `/verify-loop`, a fullauto prompt saying `invoke /verify-loop`, "verify loop", "review loop", "리뷰 받으면서", "self-review".
+description: Verified implementation loop with adaptive depth — runs the project gates and `fullauto audit` (orphans, unwired components, skipped / weakened tests, edited gate config) BEFORE any LLM review, then spawns fresh-context reviewers sized to the change — `gates` (none), `light` (code + requirements), `full` (correctness incl. wiring, security, requirements, + design for UI / public API); fixes BLOCKs, re-reviews only their dimensions, ends with `VERIFY_LOOP_RESULT:`. TRIGGER — `/verify-loop`, a fullauto prompt saying `invoke /verify-loop`, "verify loop", "review loop", "리뷰 받으면서", "self-review".
 user-invocable: true
 allowed-tools:
   - Agent
@@ -41,7 +41,7 @@ Deterministic checks first (gates + `fullauto audit`), LLM review only where it 
 
 | Arg | Default | Meaning |
 |---|---|---|
-| `depth` | inferred (manual) / stated (fullauto) | `gates` = gates + audit + one self-review, no reviewers. `light` = 2 reviewers (code, requirements). `full` = 4 (correctness, security, requirements, integration) + design when UI / public-API files changed. |
+| `depth` | inferred (manual) / stated (fullauto) | `gates` = gates + audit + one self-review, no reviewers. `light` = 2 reviewers (code, requirements). `full` = 3 (correctness incl. wiring, security, requirements) + design when UI / public-API files changed. |
 | `cycles` | `2` | Max fix-and-re-verify cycles. Cycle 1 is the initial review; each further cycle re-spawns only the dimensions that raised BLOCKs. |
 
 **Inside fullauto the prompt's depth and `verifyMaxCycles` are binding.** Never skip, downgrade, or escalate them; `Verification depth: gates` means do not invoke this skill at all. Start at Phase B.2 — the implementation is already done.
@@ -50,7 +50,7 @@ Deterministic checks first (gates + `fullauto audit`), LLM review only where it 
 
 ## Cost model
 
-Reviewer spawns per cycle: `gates` 0 · `light` 2 · `full` 4 (5 with design); cycle 2+ re-spawns only BLOCK-raising dimensions. Gates + `fullauto audit` run first every cycle, so an orphan file or a `.skip` is fixed for free before any reviewer sees the diff.
+Reviewer spawns per cycle: `gates` 0 · `light` 2 · `full` 3 (4 with design); cycle 2+ re-spawns only BLOCK-raising dimensions. Gates + `fullauto audit` run first every cycle, so an orphan file or a `.skip` is fixed for free before any reviewer sees the diff.
 
 ## The loop
 
@@ -100,7 +100,7 @@ D spawn reviewers for the depth, in ONE message → E triage
 ## Phase C — Deterministic floor (every cycle)
 
 1. **Detect gates**, first hit wins: `CLAUDE.md` / `AGENTS.md` verify command → `package.json` scripts (`typecheck`, `test`, `lint`) → `pytest -x` → `go vet ./... && go test ./...` → `cargo check && cargo test` → `make check` / `make test`. None → `No verification commands detected — review-only mode.`; never fake a gate.
-2. **Run** typecheck → test → lint; bail on the first failure.
+2. **Run** typecheck → test → lint; bail on the first failure. **Inside fullauto** the orchestrator re-runs EVERY configured gate (lint included) the moment you exit and hands a failure back as retry context, so do not duplicate that work: cycle 1 runs typecheck → test only (skip lint); cycle 2+ re-runs typecheck plus just the test files the fixes touched or cover (the full suite only when a fix changed shared code you cannot scope). Read results, not logs: a pass is its one summary line, a failure its first failing assertions.
 3. **Triage.** Red and plausibly yours → fix and re-run (cap 3 attempts per cycle, then stop and surface it). Red in a file you did not touch (check `git diff`; never stash — inside fullauto the tree holds other tasks' uncommitted work) → `INFO: pre-existing failure in <gate>`, continue. A **red TDD task** (`- tdd: red`) must fail the test gate: typecheck / lint / build green, every failing test in a file this task added → `test ✗ (expected — red task)`.
 4. **Audit** — `command -v fullauto >/dev/null 2>&1 && fullauto audit` (absent → skip silently). It diffs HEAD against the working tree, exit 1 on BLOCK: `orphan-code`, `unused-export` (WARN), `test-integrity`, `gate-integrity` (see `/wiring-audit` for the check table). The orchestrator's post-task audit additionally checks your `FULLAUTO_WIRING` claims, test counts vs baseline, and TDD red / green — treat the manifest as if it will be checked. Act on every BLOCK anchored to a file you changed; list BLOCKs on files you did not touch under INFO; fix, re-run gates + audit, then spawn reviewers. Never "fix" an audit BLOCK by deleting the artifact, the test, or the manifest line (`/tdd-loop` § Anti-cheat: no skip / weaken / delete tests, no gate-config edits, no `@ts-ignore` / `eslint-disable`).
 5. **`depth=gates` stops here**: one self-review pass over each changed file, re-run gates once if you edited anything, then Phase G.
@@ -108,7 +108,7 @@ D spawn reviewers for the depth, in ONE message → E triage
 ## Phase D — Reviewers (parallel, sized to depth)
 
 1. **Review surface**: changed files (`git status --short`, `git diff --stat`) plus the consumers named in the manifest. Reviewers do not read the repo.
-2. **Spawn the set for this depth in ONE message** (`Agent`, `subagent_type: general-purpose`, read-only, fresh context), each with the **common header** + exactly one **focus block** below. `light`: `code` + `requirements`. `full`: `correctness`, `security` (skip only for pure styling / docs), `requirements`, `integration`, plus `design` when the diff touches UI files (`.tsx/.jsx/.vue/.svelte`, `.css`, component / page dirs) or public-API surfaces (package entry points, OpenAPI / routes, published types).
+2. **Spawn the set for this depth in ONE message** (`Agent`, `subagent_type: general-purpose`, read-only, fresh context), each with the **common header** + exactly one **focus block** below. `light`: `code` + `requirements`. `full`: `correctness` (includes the wiring lens — `fullauto audit` already settled orphans and entrypoint claims, so no separate integration reviewer), `security` (skip only for pure styling / docs), `requirements`, plus `design` when the diff touches UI files (`.tsx/.jsx/.vue/.svelte`, `.css`, component / page dirs) or public-API surfaces (package entry points, OpenAPI / routes, published types).
 3. Merge findings, deduping identical file:line + reason.
 
 ### The two lenses
@@ -206,7 +206,7 @@ Bugs, broken behavior, missing edge cases, contract violations, error-handling g
 
 ```
 ## Focus: correctness
-Bugs, broken behavior, missing edge cases, type / contract violations, error-handling gaps, race conditions, and critical paths with no test (BLOCK even when gates pass). Stay in your lane; note security or wiring observations as INFO.
+Bugs, broken behavior, missing edge cases, type / contract violations, error-handling gaps, race conditions, and critical paths with no test (BLOCK even when gates pass). Wiring lens: for every manifest line open the consumer and confirm the artifact is imported AND used on an executed path — no consumer, test-only consumer, unregistered handler, unrendered component, env / flag never branched on, migration without a model change (or vice versa) = BLOCK; entrypoint claims were pre-validated by `fullauto audit`, judge execution, not path patterns; `- wired by: T###` → INFO. Stay in your lane; note security observations as INFO.
 ```
 
 ```
@@ -222,11 +222,6 @@ Input validation, auth / authz boundaries, secrets handling, injection vectors, 
 4. Test quality: the test imports and calls the REAL unit (mocked unit = BLOCK); asserts on outputs / state / effects, not only on mocks called (= BLOCK); covers the specific bullet; for a route / CLI command / journey at least one test goes through the real entry point (handler-only = BLOCK); `.skip/.only/.todo`, swallowed assertions, tautologies, `@ts-ignore` / `eslint-disable` added to pass = BLOCK.
 5. Code the requirements did not ask for: listed under `## Enhancements applied this pass` or marked `[ENHANCE:…]` → legitimate; otherwise WARN.
 6. Never flag style or implementation-detail choices unless they contradict a bullet. A bullet with an `interpreted as:` note → judge the reasoning; sound → INFO.
-```
-
-```
-## Focus: integration
-For EVERY added file, export, component, route, handler, env read, flag, and migration: find the production consumer with `git grep` (imports, JSX renders, route / handler registration, DI, `mod x;`) and verify each manifest line resolves to a real reference on an executed path. BLOCK: no consumer; consumer only in tests; handler not registered; component not rendered; env / flag never branched on; migration without model change or vice versa. Entrypoint claims were pre-validated by `fullauto audit`; do not re-derive path rules. `- wired by: T###` → INFO.
 ```
 
 ```

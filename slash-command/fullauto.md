@@ -30,7 +30,7 @@ The third mode, `fullauto evolve "<concept>"` (concept → product brief → pla
 
 | Mode | Per-task depth | When to use |
 |---|---|---|
-| `adaptive` (default) | classified per task: config / docs / test tasks and low-risk tasks → `gates` (no reviewers); medium risk → `light` (2 reviewers); high risk (auth, payments, schema, migrations, webhooks, ...) → `full` (4 reviewers, + design for UI / public-API files) | almost always |
+| `adaptive` (default) | classified per task: config / docs / test tasks and low-risk tasks → `gates` (no reviewers); medium risk → `light` (2 reviewers); high risk (auth, payments, schema, migrations, webhooks, ...) → `full` (3 reviewers, + design for UI / public-API files); a retry whose previous attempt already passed review clean and only failed a gate / audit drops to `gates` | almost always |
 | `full` | every task → `full` | small, high-stakes task lists where cost is irrelevant |
 | `gates-only` | every task → `gates`; no reviewer subagents at all, deterministic gates + audit only | fast iteration, CI smoke, or when the project has strong tests |
 | `feature` | every task → `gates`, plus one synthetic `VERIFY-<feature>` task at `full` after each feature group (Speckit `[USx]` story or h2 heading) | long task lists where per-task review is redundant but a per-story review is wanted |

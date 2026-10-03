@@ -292,6 +292,8 @@ export interface FreshRunArgs {
   vibeEnhance?: boolean;
   /** CLI-level override for config.verifyMode (`--verify`). */
   verifyMode?: VerifyMode;
+  /** Remaining run-wide enhance budget carried over from earlier evolve rounds (default: `config.enhanceBudget`). */
+  enhanceBudgetRemaining?: number;
   /**
    * Timing fields for the final report. Captured by the caller so `auto`
    * mode can include the planner stage in the total wall-clock. When
@@ -390,6 +392,7 @@ export async function startFreshRun(args: FreshRunArgs): Promise<RunState | null
     extraPasses: 0,
     rateLimitHits: 0,
     rateLimitWaitMs: 0,
+    ...(args.enhanceBudgetRemaining !== undefined ? { enhanceBudgetRemaining: args.enhanceBudgetRemaining } : {}),
   };
   await saveState(projectDir, state);
 

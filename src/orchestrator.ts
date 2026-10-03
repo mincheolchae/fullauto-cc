@@ -5,14 +5,14 @@ import type { AuditFinding, AuditInput, AuditResult, TaskDiff, TestCounts, TreeS
 import { TaskQueue } from './queue.js';
 import { runSubagent, parseSubagentVerdict, parseEnhanceResult, type OtherTaskRef } from './runner/claude.js';
 import { runGates, evaluateGates, summarizeGateOutput } from './runner/gates.js';
-import { InterruptedError, shutdownSignal, throwIfInterrupted } from './runner/process-group.js';
-import { classifyTask, depthFor, describeClassification, effectiveVerifyMode } from './task-class.js';
+import { InterruptedError, RateLimitPausedError, shutdownSignal, throwIfInterrupted } from './runner/process-group.js';
+import { classifyTask, depthFor, describeClassification, effectiveVerifyMode, priorCleanReview } from './task-class.js';
 import { maybeInjectGroupTasks, sweepCompletedFeatures } from './synthetic-tasks.js';
-import { takeSnapshot, diffSnapshots, runAudit, renderFindings, sortFindings, type AuditRunResult } from './audit/index.js';
+import { takeSnapshot, diffSnapshots, runAudit, renderFindings, sortFindings, parseVerifyLoopResult, type AuditRunResult } from './audit/index.js';
 import { sha1String } from './audit/snapshot.js';
 import { parseTestOutput } from './audit/test-output.js';
 import { buildRedTestRecord } from './audit/tdd.js';
-import { captureTree, rollbackToTree } from './rollback.js';
+import { captureTree, reapplyPatch, rollbackToTree } from './rollback.js';
 import {
   saveState,
   logPathFor,
@@ -108,6 +108,7 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
   }
 
   try {
+    await checkGateBaseline(state, projectDir);
     while (!queue.isComplete()) {
       throwIfInterrupted();
       if (state.currentPass > passLimit(state)) {
@@ -115,6 +116,15 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
           `Reached maxPasses (${passLimit(state)}) — stopping. Remaining tasks will be reported as deferred.`
         );
         break;
+      }
+
+      // A task interrupted / rate-limit-paused mid-attempt resumes as `pending`,
+      // but pass >= 2 only offers `deferred` tasks: without this it would sit
+      // out the rest of the pass (and be failed outright when this is the last
+      // pass). Re-queue it NOW so the resume retry is free, as advertised.
+      if (state.currentPass > 1 && state.tasks.some(isInterruptedPending)) {
+        requeueResumedPendingTasks(state, isInterruptedPending);
+        await saveState(projectDir, state);
       }
 
       let { ready, blocked } = countEligibleInCurrentPass(queue, state);
@@ -220,13 +230,49 @@ export async function runOrchestrator(opts: RunOptions): Promise<RunState> {
       await saveState(projectDir, state);
       const inflight = state.tasks.find((t) => t.status === 'in_progress');
       printWarn(
-        `Interrupted by ${err.signal}${inflight ? ` during ${inflight.id} (attempt ${inflight.attempts.length})` : ''} — state saved to ${paths(projectDir).statePath}; run \`fullauto resume\` to continue.`
+        err instanceof RateLimitPausedError
+          ? `Run paused — ${err.detail}. State saved to ${paths(projectDir).statePath}; the API is still saturated, so run \`fullauto resume\` once the usage window resets (the paused task is retried without costing a pass).`
+          : `Interrupted by ${err.signal}${inflight ? ` during ${inflight.id} (attempt ${inflight.attempts.length})` : ''} — state saved to ${paths(projectDir).statePath}; run \`fullauto resume\` to continue.`
       );
     }
     throw err;
   } finally {
     await services.stopAll((name, line) => printServiceLine(name, line));
   }
+}
+
+/** Gate roles whose red state at baseline can never be "something this run is about to build". */
+const BASELINE_BLOCKING_ROLES: ReadonlySet<string> = new Set(['typecheck', 'test', 'lint', 'build']);
+
+/**
+ * Fresh runs only (no task has an attempt yet): run the gates once on the
+ * untouched tree. See `RunConfig.baselineCheck`. Not persisted — it is a
+ * pre-flight, and `fullauto resume` after the user fixed the cause simply
+ * re-runs it.
+ */
+async function checkGateBaseline(state: RunState, projectDir: string): Promise<void> {
+  const mode = state.config.baselineCheck;
+  if (mode === 'off' || state.config.gates.length === 0) return;
+  if (state.tasks.some((t) => t.attempts.length > 0)) return;
+  printInfo(`Baseline: running ${state.config.gates.length} gate(s) on the untouched tree before any task…`);
+  const results = await runGates(state.config, projectDir);
+  throwIfInterrupted();
+  const red = results.filter((g) => !g.passed && !g.skipped);
+  if (red.length === 0) return;
+  const shellNames = new Set(state.config.gates.filter((g) => g.type === 'shell').map((g) => g.name));
+  const blocking = red.filter((g) => shellNames.has(g.name) && BASELINE_BLOCKING_ROLES.has(g.role ?? 'other'));
+  const describe = (g: GateResult): string => {
+    const tail = summarizeGateOutput(g.output, 1500).text.trim();
+    return `  - ${g.name} (exit ${g.exitCode}): ${g.command}\n${tail.split('\n').slice(-12).map((l) => `      ${l}`).join('\n')}`;
+  };
+  if (mode === 'abort' && blocking.length > 0) {
+    throw new Error(
+      `Baseline gate check failed before any task ran — these gates are already red on the untouched tree, so every task would fail them identically (and burn its retries):\n${blocking.map(describe).join('\n')}\nFix the cause (install dependencies, repair the failing check), or set "baselineCheck": "warn" | "off" in .fullauto/config.json, then run \`fullauto resume\`.`
+    );
+  }
+  printWarn(
+    `Baseline: ${red.length} gate(s) already red before any task ran — tasks that depend on them will defer:\n${red.map(describe).join('\n')}`
+  );
 }
 
 /** `config.maxPasses` plus whatever `fullauto retry` granted. */
@@ -297,9 +343,14 @@ async function maybeAdvancePass(
  * are trying to enable. If no in-flight attempt exists (hand-edited state),
  * an unfinished synthetic one carries the annotation instead.
  */
-function requeueResumedPendingTasks(state: RunState): void {
+/** A `pending` task that carries an unfinished attempt: it was interrupted (or rate-limit paused) mid-run, not dependency-blocked. */
+function isInterruptedPending(t: Task): boolean {
+  return t.status === 'pending' && t.attempts.some((a) => a.finishedAt === undefined);
+}
+
+function requeueResumedPendingTasks(state: RunState, only: (t: Task) => boolean = () => true): void {
   for (const t of state.tasks) {
-    if (t.status !== 'pending') continue;
+    if (t.status !== 'pending' || !only(t)) continue;
     const lastCompleted = [...t.attempts].reverse().find((a) => a.deferReason);
     t.status = 'deferred';
     let inflight = [...t.attempts].reverse().find((a) => a.finishedAt === undefined);
@@ -317,6 +368,9 @@ function requeueResumedPendingTasks(state: RunState): void {
     printInfo(`Resume: ${t.id} was interrupted mid-task — re-queued for retry in pass ${state.currentPass}.`);
   }
 }
+
+/** Text in a paused attempt's `deferDetail` that marks it as a rate-limit pause (see `processOneTask`). */
+const RATE_LIMIT_PAUSE_MARK = 'still rate-limited';
 
 /** Defer detail for a red task whose test gate passed (see processOneTask step 6). */
 export const RED_EXPECTED_MESSAGE =
@@ -509,7 +563,14 @@ async function processOneTask(
   //    red in pass 2; a resumed run may carry a hand-edited tasks list).
   const cls = classifyTask(task, state.tasks);
   resolveGreenRedSets(cls, task, state);
-  const depth = depthFor(cls, state.config);
+  const baseDepth = depthFor(cls, state.config);
+  const depth = depthFor(cls, state.config, task);
+  if (depth !== baseDepth) {
+    const reviewed = priorCleanReview(task, baseDepth);
+    cls.rationale.push(
+      `verify depth ${baseDepth} → ${depth}: attempt ${task.attempts.indexOf(reviewed!) + 1} already passed ${reviewed!.verifyLoop!.depth} review clean; this retry repairs a deterministic failure the gates + audit re-check`
+    );
+  }
   attempt.classification = cls;
   attempt.verifyDepth = depth;
   attempt.tdd = { phase: cls.tdd };
@@ -598,8 +659,16 @@ async function processOneTask(
     if (touched && 'diff' in touched) attempt.touched = touchedFromDiff(touched.diff, before, priorTouched);
     else await recordTouched(attempt, before, priorTouched, projectDir, touched?.after);
     await rollbackDeferredAttempt(task, attempt, attemptNum, projectDir, state, before);
+    if (!attempt.rollback || attempt.rollback.failed > 0) chargeEnhanceBudget(task, attempt, state);
     printTaskDeferred(task, printed, gates, attempt);
   };
+
+  // 0b. Retry after an additive-only audit failure: put the previous attempt's
+  //     (correct, merely incomplete) work back instead of paying for a full
+  //     re-implementation. Done AFTER the baseline above, so this attempt's
+  //     own rollback still restores the true pre-task tree and its audit diff
+  //     still counts the re-applied files as this task's changes.
+  await reapplyPreviousWork(task, attempt, projectDir);
 
   // 1. Run the implementer subagent.
 
@@ -631,16 +700,19 @@ async function processOneTask(
   // the wait happened either way, and the final report should show it.
   state.rateLimitHits = (state.rateLimitHits ?? 0) + subagentRes.rateLimitHits;
   state.rateLimitWaitMs = (state.rateLimitWaitMs ?? 0) + subagentRes.rateLimitWaitMs;
+  // The `VERIFY_LOOP_RESULT:` receipt, kept on the attempt so a retry can tell
+  // "reviewers passed this, a gate failed" from "never reviewed" (depthFor).
+  const receipt = parseVerifyLoopResult(subagentRes.stdout);
+  if (receipt) attempt.verifyLoop = receipt;
 
-  // Enhance-pass accounting: what the skill applied comes off the run
-  // budget whether or not the gates later pass (the additions are in the
-  // tree either way), and `promote` ids ride along for /product-assess.
+  // Enhance-pass accounting: record what the skill reported now (`promote`
+  // ids ride along for /product-assess); the BUDGET is charged only once we
+  // know the additions stay in the tree — on success, or on a defer that
+  // could not roll them back (`chargeEnhanceBudget`). An attempt that was
+  // rolled back added nothing, so it must not eat the budget.
   if (task.kind === 'enhance') {
     const enhance = parseEnhanceResult(subagentRes.stdout);
-    if (enhance) {
-      attempt.enhance = enhance;
-      state.enhanceBudgetRemaining = Math.max(0, (state.enhanceBudgetRemaining ?? state.config.enhanceBudget) - enhance.applied);
-    }
+    if (enhance) attempt.enhance = enhance;
   }
 
   // The tree-diff audit cannot see the gitignored config files; check them
@@ -671,9 +743,26 @@ async function processOneTask(
     // did something wrong. `rate_limited` lets the final report and a human
     // skimming deferred tasks tell that apart from a real failure.
     if (subagentRes.stillRateLimited) {
-      const detail = `Subagent still rate-limited after ${subagentRes.rateLimitHits} consecutive hit(s) (waited ${(subagentRes.rateLimitWaitMs / 1000).toFixed(0)}s total); exited with code ${subagentRes.exitCode}`;
-      await settleDefer('rate_limited', detail, detail, []);
-      return;
+      const detail = `${task.id}: subagent ${RATE_LIMIT_PAUSE_MARK} after ${subagentRes.rateLimitHits} consecutive hit(s) (waited ${(subagentRes.rateLimitWaitMs / 1000).toFixed(0)}s total); exited with code ${subagentRes.exitCode}`;
+      // Pause the whole run rather than defer + move on: every later task
+      // would burn its own backoff budget against the same saturated API, and
+      // each task would lose passes without having been genuinely attempted.
+      // The attempt stays unfinished (like an interruption), so `resume`
+      // retries it without charging a pass.
+      //
+      // The rate-limit sniffer is deliberately broad, so a task whose own
+      // failure text merely LOOKS rate-limited (e.g. it implements rate
+      // limiting and crashes) would pause forever: a task that already paused
+      // the run once is deferred like any other failure instead.
+      const pausedBefore = task.attempts.some(
+        (a) => a !== attempt && a.finishedAt === undefined && a.deferDetail?.includes(RATE_LIMIT_PAUSE_MARK)
+      );
+      if (pausedBefore) {
+        await settleDefer('rate_limited', detail, detail, []);
+        return;
+      }
+      attempt.deferDetail = detail;
+      throw new RateLimitPausedError(detail);
     }
     const detail = `Subagent exited with code ${subagentRes.exitCode}`;
     await settleDefer('subagent_error', detail, detail, []);
@@ -842,8 +931,53 @@ async function processOneTask(
   // 7. Done. Fold this attempt's evidence into run-level TDD/wiring state.
   task.status = 'done';
   attempt.finishedAt = new Date().toISOString();
+  chargeEnhanceBudget(task, attempt, state);
   applySuccessToState(task, cls, state, counts, audit, diff, after);
   printTaskDone(task, gates, new Date(attempt.finishedAt).getTime() - new Date(attempt.startedAt).getTime(), attempt);
+}
+
+/**
+ * Audit checks whose BLOCK means "something is MISSING" (a wiring, a test, a
+ * receipt) rather than "the attempt did something forbidden" — the work
+ * itself is salvageable. Cheating checks (`test-integrity`, `gate-integrity`,
+ * `tdd-*`) are never here: those attempts stay rolled back.
+ */
+const REAPPLY_AUDIT_CHECKS: ReadonlySet<string> = new Set([
+  'orphan-code',
+  'unused-export',
+  'wiring-manifest',
+  'pending-wiring',
+  'verify-evidence',
+  'test-count',
+]);
+
+/**
+ * When the previous real attempt got through the gates and was deferred ONLY
+ * for additive audit BLOCKs, `git apply` its saved patch back (all or
+ * nothing). Retrying from scratch costs a whole implementer run to rediscover
+ * work that was already right. Marks `rollback.reapplied` so the prompt says
+ * so; a patch that no longer applies cleanly just falls back to the normal
+ * "rolled back, here is the patch" notice.
+ */
+async function reapplyPreviousWork(task: Task, current: TaskAttempt, projectDir: string): Promise<void> {
+  const floor = task.baselineResetAtAttempt ?? 0;
+  const prev = [...task.attempts]
+    .filter((a, i) => i >= floor && a !== current && a.finishedAt !== undefined && a.deferReason !== 'depends_on_unfinished_task')
+    .pop();
+  if (!prev || prev.deferReason !== 'audit_failed' || !prev.rollback?.patchPath) return;
+  if (prev.rollback.failed > 0 || prev.rollback.files === 0) return;
+  const blocks = (prev.audit?.findings ?? []).filter((f) => f.severity === 'block');
+  if (blocks.length === 0 || !blocks.every((f) => REAPPLY_AUDIT_CHECKS.has(f.check))) return;
+  if (await reapplyPatch(projectDir, prev.rollback.patchPath)) {
+    prev.rollback.reapplied = true;
+    printInfo(`${task.id}: re-applied the previous attempt's work (${prev.rollback.files} file(s)) — it failed only additive audit checks.`);
+  }
+}
+
+/** Take what an enhance attempt applied off the run's enhance budget (no-op for other tasks / no report). */
+function chargeEnhanceBudget(task: Task, attempt: TaskAttempt, state: RunState): void {
+  if (task.kind !== 'enhance' || !attempt.enhance) return;
+  state.enhanceBudgetRemaining = Math.max(0, (state.enhanceBudgetRemaining ?? state.config.enhanceBudget) - attempt.enhance.applied);
 }
 
 /** The failed gate's full captured output, next to the subagent transcript. */

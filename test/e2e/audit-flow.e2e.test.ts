@@ -557,6 +557,101 @@ describe('(h) verify-evidence: the depth the implementer was told is enforced by
   });
 });
 
+describe('(h2) a retry does not re-run reviewers that already passed', () => {
+  // risk=high → `full`. Pass 1 emits a clean receipt and leaves Foo orphaned (audit_failed);
+  // pass 2 wires it. The retry only has to repair a deterministic failure.
+  const orphanThenWire = (receipt: string[]) =>
+    makeTask('T001', {
+      title: 'Create Foo component',
+      body: [
+        'Create Foo component',
+        '- risk: high',
+        '- no test: fixture',
+        'FAKE: write src/components/Foo.mjs',
+        "FAKE: append src/index.mjs import './components/Foo.mjs';",
+        'FAKE: once t001-unwire write src/index.mjs',
+        ...receipt,
+      ].join('\n'),
+    });
+
+  it('clean full-depth receipt + audit_failed → pass 2 runs at gates (prompt says so, rationale says why)', async () => {
+    const result = await runFresh([orphanThenWire(['FAKE: echo VERIFY_LOOP_RESULT: depth=full cycles=1 block=0 warn=0'])], {
+      maxPasses: 3,
+      useVerifyLoop: true,
+      verifyMode: 'adaptive',
+      audit: { enabled: true, testCount: false },
+    });
+    const t = byId(result, 'T001');
+    expect(t.status).toBe('done');
+    expect(t.attempts.map((a) => [a.verifyDepth, a.deferReason])).toEqual([
+      ['full', 'audit_failed'],
+      ['gates', undefined],
+    ]);
+    expect(t.attempts[0].verifyLoop).toMatchObject({ depth: 'full', block: 0 });
+    expect(t.attempts[1].classification?.rationale.some((r) => /verify depth full → gates: attempt 1 already passed full review clean/.test(r))).toBe(true);
+    const prompts = await fake.prompts();
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain('## Verification depth: full');
+    expect(prompts[1]).toContain('## Verification depth: gates');
+    expect(prompts[1]).toContain('Do NOT invoke /verify-loop');
+  });
+
+  it('no receipt on pass 1 (the review never happened) → the retry keeps depth=full', async () => {
+    const result = await runFresh([orphanThenWire([])], { maxPasses: 3, useVerifyLoop: true, verifyMode: 'adaptive', audit: { enabled: true, testCount: false } });
+    const t = byId(result, 'T001');
+    expect(t.attempts.slice(0, 2).map((a) => a.verifyDepth)).toEqual(['full', 'full']); // [2] is the synthetic promoted-to-failed attempt
+    expect(t.attempts[0].verifyLoop).toBeUndefined();
+  });
+});
+
+describe('(h3) additive-only audit failures are repaired in place, not re-implemented', () => {
+  it('orphan on pass 1 → the saved patch is re-applied before pass 2 and the prompt says so', async () => {
+    const result = await runFresh(
+      [
+        makeTask('T001', {
+          title: 'Create Foo component',
+          body: [
+            'Create Foo component',
+            '- no test: fixture',
+            // Pass 1: Foo is written but left unreferenced. Pass 2 ONLY wires it —
+            // it never writes Foo, so Foo can exist only if the orchestrator put it back.
+            'FAKE: nth foo 1 write src/components/Foo.mjs',
+            "FAKE: nth foo 2 append src/index.mjs import './components/Foo.mjs';",
+          ].join('\n'),
+        }),
+      ],
+      { maxPasses: 3 }
+    );
+    const t = byId(result, 'T001');
+    expect(t.status).toBe('done');
+    expect(t.attempts[0].deferReason).toBe('audit_failed');
+    expect(t.attempts[0].rollback).toMatchObject({ files: 1, deleted: 1, reapplied: true });
+    const prompts = await fake.prompts();
+    expect(prompts[1]).toContain('RE-APPLIED');
+    expect(await readFile(join(projectDir, 'src/components/Foo.mjs'), 'utf-8')).toContain('written by fake claude');
+  });
+
+  it('a cheating failure (test-integrity) stays rolled back and is NOT re-applied', async () => {
+    const result = await runFresh(
+      [
+        makeTask('T001', {
+          title: 'Add skipped tests',
+          body: [
+            'Add skipped tests',
+            '- kind: test',
+            "FAKE: once skip append test/skipped.test.mjs import { test } from 'node:test'; test.skip('later', () => {});",
+          ].join('\n'),
+        }),
+      ],
+      { maxPasses: 2 }
+    );
+    const t = byId(result, 'T001');
+    expect(t.attempts[0].rollback?.reapplied).toBeUndefined();
+    expect(existsSync(join(projectDir, 'test/skipped.test.mjs'))).toBe(false);
+    expect((await fake.prompts())[1]).not.toContain('RE-APPLIED');
+  });
+});
+
 describe('(i) `- tests: T###` naming a task that is not in the run (hand-edited state bypasses the validator)', () => {
   it('the delegation is ignored with a rationale note and the task is held to the behavior-task rule', async () => {
     const result = await runFresh(

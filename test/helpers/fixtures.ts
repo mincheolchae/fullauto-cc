@@ -51,6 +51,8 @@ export function makeConfig(overrides: Record<string, unknown> = {}): RunConfig {
     maxPasses: 2,
     subagentTimeoutSec: 60,
     useVerifyLoop: false,
+    // Fixtures use gates with one-shot side effects (fail once, then pass); a baseline run would consume them.
+    baselineCheck: 'off',
     gates: [{ name: 'ok', command: 'true' }],
     // Deterministic post-task audit (workstream A1/A2). Unknown to older
     // schemas — zod strips it, so this is harmless until the key lands.

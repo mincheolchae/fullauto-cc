@@ -196,6 +196,9 @@ class TailBuffer {
 
 // ---------- rate-limit-aware spawn ----------
 
+/** How much of a failed spawn's stdout is scanned for rate-limit text (the CLI prints its error last). */
+const RATE_LIMIT_SCAN_TAIL_CHARS = 2000;
+
 export interface SpawnWithBackoffResult extends SpawnClaudeResult {
   /** Consecutive rate-limit hits this call backed off and retried through (0 = none detected). */
   rateLimitHits: number;
@@ -234,7 +237,11 @@ export async function spawnClaudeWithBackoff(
     if (res.exitCode === 0) {
       return { ...res, rateLimitHits: hits, rateLimitWaitMs: waitMs, stillRateLimited: false };
     }
-    const signal = detectRateLimit(`${res.stdout}\n${res.stderrTail}`);
+    // A timeout is the subagent being slow, not the API refusing it — and its
+    // (huge) transcript can quote "rate limit" / "429" from the very code it
+    // was writing. Only the tail of a short failure carries the CLI's own
+    // error text, so only that is scanned.
+    const signal: ReturnType<typeof detectRateLimit> = res.timedOut ? { limited: false } : detectRateLimit(`${res.stdout.slice(-RATE_LIMIT_SCAN_TAIL_CHARS)}\n${res.stderrTail}`);
     if (!signal.limited) {
       return { ...res, rateLimitHits: hits, rateLimitWaitMs: waitMs, stillRateLimited: false };
     }
@@ -383,6 +390,12 @@ export function rollbackNoticeLines(task: Task): string[] {
   const partial = r.failed > 0
     ? ` WARNING: ${r.failed} file(s) could NOT be restored and may still contain the previous attempt's broken changes — check the tree state of anything you touch before trusting it.`
     : '';
+  if (r.reapplied) {
+    return [
+      ``,
+      `Your previous attempt's changes (${r.files} file(s)) failed only ADDITIVE audit checks (a missing wiring / test / receipt, not broken code), so the orchestrator rolled them back and then RE-APPLIED them from ${r.patchPath ?? 'the saved patch'}: they are in the tree now, exactly as you left them. Do NOT re-implement — add what the defer signal above says is missing, and re-verify.`,
+    ];
+  }
   return [
     ``,
     `Your previous attempt's changes were rolled back (${r.files} file(s): ${r.restored} restored, ${r.deleted} removed); ${where}.${partial} Re-apply what was correct (\`git apply ${r.patchPath ?? '<patch>'}\`, add \`--3way\` if it does not apply cleanly, or re-do it by hand), then fix what the defer signal above describes. Do not assume any file from that attempt still exists.`,
@@ -446,7 +459,7 @@ export function verificationDepthSection(
   const reviewers =
     depth === 'light'
       ? `Light depth spawns two reviewers (code: correctness + security + integration; requirements-fit).`
-      : `Full depth spawns correctness, security, requirements-fit and integration reviewers (plus design when UI / public-API files changed).`;
+      : `Full depth spawns correctness (incl. wiring), security and requirements-fit reviewers (plus design when UI / public-API files changed).`;
   return [
     `## Verification depth: ${depth}`,
     `Depth is \`${depth}\` (${why}). When it compiles and the smoke path works, invoke \`/verify-loop depth=${depth} cycles=${cycles}\` (\`verifyMaxCycles\` from the config — never more). ${reviewers} Fix every BLOCK; report WARN/INFO but do not auto-fix them. BLOCKs left after the cycle cap → the DEFER protocol below, one \`unmet:\` per BLOCK.`,

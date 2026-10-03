@@ -406,7 +406,7 @@ describe('(e) subagent errors and resume', () => {
     expect(await fake.prompts()).toHaveLength(2);
   });
 
-  it('resume at pass >= 2: the reset pending task is promoted to deferred at pass end and retried in the next pass', async () => {
+  it('resume at pass >= 2: the interrupted task is re-queued at the top of the pass and retried in THE SAME pass, alongside other deferred tasks', async () => {
     const crashed = makeState(
       [
         makeTask('T001', {
@@ -439,14 +439,14 @@ describe('(e) subagent errors and resume', () => {
 
     const resumed = await resumeFromDisk();
     expect(resumed.tasks.map((t) => t.status)).toEqual(['done', 'done']);
-    expect(resumed.currentPass).toBe(3);
+    // No pass is charged for the interruption: both tasks finish in pass 2.
+    expect(resumed.currentPass).toBe(2);
 
     const t1 = byId(resumed, 'T001');
     expect(t1.attempts.map((a) => [a.passNumber, a.deferReason, a.finishedAt !== undefined])).toEqual([
       [1, 'gate_failed', true],
-      [2, undefined, false], // crashed attempt preserved
-      [2, 'depends_on_unfinished_task', true], // pending → deferred promotion at end of pass 2
-      [3, undefined, true],
+      [2, 'gate_failed', false], // crashed attempt preserved, annotated with the last real defer reason
+      [2, undefined, true],
     ]);
     const t2 = byId(resumed, 'T002');
     expect(t2.attempts.map((a) => [a.passNumber, a.deferReason])).toEqual([

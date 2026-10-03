@@ -209,6 +209,21 @@ describe('(e) enhance budget', () => {
     expect(prompts[3]).not.toContain('budget=0');
   }, 20_000);
 
+  it('an enhance attempt that is deferred AND rolled back adds nothing, so it does not eat the budget', async () => {
+    await fake.script('# vibe-enhance pass', 'FAKE: write src/enh.ts\nFAKE: echo FULLAUTO_ENHANCE: applied=2 optional=0 promote=none\nFAKE: defer because blocks remain');
+    const result = await runFresh([makeTask('T001', { title: 'X', body: 'FAKE: write src/x.ts' })], { maxPasses: 1, vibeEnhance: true, enhanceBudget: 3 });
+    const enh = byId(result, 'ENHANCE-all');
+    expect(enh.attempts[0].rollback?.deleted).toBe(1);
+    expect(enh.attempts[0].enhance?.applied).toBe(2);
+    expect(result.enhanceBudgetRemaining).toBe(3);
+  }, 20_000);
+
+  it('...but when the additions could NOT be rolled back (rollbackOnDefer: false) they stay in the tree and are charged', async () => {
+    await fake.script('# vibe-enhance pass', 'FAKE: write src/enh.ts\nFAKE: echo FULLAUTO_ENHANCE: applied=2 optional=0 promote=none\nFAKE: defer because blocks remain');
+    const result = await runFresh([makeTask('T001', { title: 'X', body: 'FAKE: write src/x.ts' })], { maxPasses: 1, vibeEnhance: true, enhanceBudget: 3, rollbackOnDefer: false });
+    expect(result.enhanceBudgetRemaining).toBe(1);
+  }, 20_000);
+
   it('does not go negative and leaves the budget alone when the line is missing', async () => {
     const result = await runFresh([makeTask('T001', { title: 'X', body: 'FAKE: write src/x.ts' })], { maxPasses: 2, vibeEnhance: true, enhanceBudget: 1 });
     expect(result.enhanceBudgetRemaining).toBe(1);

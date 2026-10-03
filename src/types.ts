@@ -232,6 +232,13 @@ export const RollbackInfo = z.object({
    * state.json files (written before this field existed) still load.
    */
   failed: z.number().int().nonnegative().default(0),
+  /**
+   * Set when the NEXT attempt's orchestrator put `patchPath` back into the
+   * tree before spawning (the previous defer was an additive-only audit
+   * failure — see `REAPPLY_AUDIT_CHECKS` in orchestrator.ts), so the retry
+   * fixes the gap instead of re-implementing the whole task.
+   */
+  reapplied: z.boolean().optional(),
 });
 export type RollbackInfo = z.infer<typeof RollbackInfo>;
 
@@ -255,6 +262,20 @@ export const TaskAttempt = z.object({
   classification: TaskClassificationSchema.optional(),
   /** Verification depth handed to the implementer (gates | light | full). */
   verifyDepth: VerifyDepthSchema.optional(),
+  /**
+   * The implementer's `VERIFY_LOOP_RESULT:` receipt for this attempt (absent
+   * when it emitted none). A retry reads it: reviewers that already ran clean
+   * are not re-spawned to re-check a deterministic gate / audit failure
+   * (`depthFor` in task-class.ts).
+   */
+  verifyLoop: z
+    .object({
+      depth: VerifyDepthSchema,
+      cycles: z.number().int().nonnegative().optional(),
+      block: z.number().int().nonnegative().optional(),
+      warn: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
   /** Post-task deterministic audit result (findings + counts). */
   audit: AuditResultSchema.optional(),
   tdd: TddAttemptInfo.optional(),
@@ -533,7 +554,7 @@ export const RunConfig = z.object({
    *
    * Default raised from 1800 (30min) under the accuracy > speed > cost
    * priority: a high-risk task at `full` depth (implementation + up to
-   * `verifyMaxCycles` review cycles of four reviewer subagents + gates)
+   * `verifyMaxCycles` review cycles of three reviewer subagents + gates)
    * routinely approaches 30min, and timeout-defer means the next pass
    * starts from scratch — pure waste. 60min lets harder tasks finish on
    * the first attempt rather than churn across passes.
@@ -577,8 +598,10 @@ export const RunConfig = z.object({
    * How much LLM review each task gets on top of the deterministic gates +
    * audit. `adaptive` (default) picks per task from its classification:
    * config/docs/test/low-risk → gates only; medium → light (2 reviewers);
-   * high risk (auth/payments/schema/…) → full (4 reviewers); synthetic
-   * enhance/verify passes → light. `full` forces
+   * high risk (auth/payments/schema/…) → full (3 reviewers); synthetic
+   * enhance/verify passes → light. A RETRY whose previous attempt already got
+   * a clean review and only failed a deterministic gate / audit check drops to
+   * gates (no re-review). `full` forces
    * full on every task (old behavior, most expensive). `gates-only` never
    * invokes /verify-loop. `feature` runs gates-only per task and one full
    * /verify-loop over the combined diff when a feature group completes.
@@ -592,6 +615,17 @@ export const RunConfig = z.object({
   verifyMaxCycles: z.number().int().positive().default(2),
   /** Per-check toggles for the post-task deterministic audit (src/audit). */
   audit: AuditConfig.default({}),
+  /**
+   * Run every gate ONCE against the untouched tree before the first task of a
+   * fresh run. A gate that is already red (deps not installed, a pre-existing
+   * type error, a broken test) fails every task identically — task count x
+   * attempts full-price subagent spawns on an outcome no implementer can
+   * change. `abort` (default) stops the run before any spawn when a shell
+   * typecheck / test / lint / build gate is red; `warn` only reports it; `off`
+   * skips the check. http / convex-fn / e2e gates only ever warn: they may
+   * legitimately probe something the run is about to build.
+   */
+  baselineCheck: z.enum(['abort', 'warn', 'off']).default('abort'),
   /**
    * When a task is deferred for ANY reason (gate failure, audit BLOCK, DEFER
    * marker, subagent error / timeout), restore every path it touched to the
@@ -662,8 +696,10 @@ export const RunConfig = z.object({
   /**
    * Consecutive rate-limit hits a single subagent spawn will back off and
    * retry (WITHIN the same task attempt / pass — see runner/claude.ts
-   * `spawnClaudeWithBackoff`) before giving up and deferring the task with
-   * `DeferReason: 'rate_limited'`. At the default backoff schedule this is
+   * `spawnClaudeWithBackoff`) before giving up and PAUSING the run
+   * (`RateLimitPausedError`, exit 75; `fullauto resume` continues without
+   * charging a pass) — deferring and moving on would only make every later
+   * task burn its own backoff budget against the same saturated API. At the default backoff schedule this is
    * roughly 1.5h of patient waiting before a still-saturated API defers to
    * the next pass, rather than an unattended run hanging forever on one task.
    * When the CLI's error names an exact reset time (`resetHintSleepMs` in

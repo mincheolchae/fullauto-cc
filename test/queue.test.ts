@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { TaskQueue, stuckOnIdenticalGateFailure } from '../src/queue.js';
+import { TaskQueue, stuckOnIdenticalGateFailure, syntheticAttemptsExhausted } from '../src/queue.js';
 import { makeAttempt, makeState, makeTask } from './helpers/fixtures.js';
 import type { GateResult } from '../src/types.js';
 
@@ -230,6 +230,100 @@ describe('stuckOnIdenticalGateFailure', () => {
       baselineResetAtAttempt: 2,
     });
     expect(stuckOnIdenticalGateFailure(task)).toBe(false);
+  });
+});
+
+describe('stuckOnIdenticalGateFailure — beyond byte-identical gate output', () => {
+  const done = new Date().toISOString();
+  const withReason = (pass: number, reason: NonNullable<ReturnType<typeof makeAttempt>['deferReason']>, deferDetail: string, extra: object = {}) =>
+    makeAttempt(pass, { finishedAt: done, deferReason: reason, deferDetail, ...extra });
+  const auditAttempt = (pass: number, messages: string[]) =>
+    withReason(pass, 'audit_failed', 'blocked', {
+      audit: {
+        blocked: true,
+        changed: { added: 0, modified: 0, deleted: 0 },
+        findings: messages.map((message) => ({ check: 'orphan-code', severity: 'block', path: 'src/a.ts', message })),
+      },
+    });
+
+  it('gate output that differs only in timings / timestamps is still the same failure', () => {
+    const task = makeTask('T001', {
+      attempts: [
+        gateFailedAttempt(1, 'test', 1, 'FAIL a.test.ts > x (35ms)\n Duration  1.42s\n at 2026-10-02T11:00:01.123Z'),
+        gateFailedAttempt(2, 'test', 1, 'FAIL a.test.ts > x (41ms)\n Duration  1.98s\n at 2026-10-02T11:07:44.900Z'),
+      ],
+    });
+    expect(stuckOnIdenticalGateFailure(task)).toBe(true);
+  });
+
+  it('a changing failure COUNT is progress, not noise', () => {
+    const task = makeTask('T001', {
+      attempts: [gateFailedAttempt(1, 'test', 1, 'Tests  5 failed | 10 passed'), gateFailedAttempt(2, 'test', 1, 'Tests  3 failed | 12 passed')],
+    });
+    expect(stuckOnIdenticalGateFailure(task)).toBe(false);
+  });
+
+  it('same audit BLOCK set twice (order-insensitive) is stuck; a different set is not', () => {
+    expect(stuckOnIdenticalGateFailure(makeTask('T', { attempts: [auditAttempt(1, ['a', 'b']), auditAttempt(2, ['b', 'a'])] }))).toBe(true);
+    expect(stuckOnIdenticalGateFailure(makeTask('T', { attempts: [auditAttempt(1, ['a', 'b']), auditAttempt(2, ['a'])] }))).toBe(false);
+  });
+
+  it('same unmet bullets AND same attempted fix twice is stuck; a different fix, a shrinking list, or no unmet is not', () => {
+    const v = (pass: number, detail: string) => withReason(pass, 'verify_loop_blocks_remaining', detail);
+    const same = makeTask('T', { attempts: [v(1, 'cause | unmet: POST /x | unmet: GET /y | last-attempt: added guard'), v(2, 'other | unmet: GET /y | unmet: POST /x | last-attempt: added guard')] });
+    expect(stuckOnIdenticalGateFailure(same)).toBe(true);
+    const newFix = makeTask('T', { attempts: [v(1, 'c | unmet: POST /x | last-attempt: added guard'), v(2, 'c | unmet: POST /x | last-attempt: rewrote handler')] });
+    expect(stuckOnIdenticalGateFailure(newFix)).toBe(false);
+    const shrinking = makeTask('T', { attempts: [v(1, 'c | unmet: POST /x | unmet: GET /y'), v(2, 'c | unmet: GET /y')] });
+    expect(stuckOnIdenticalGateFailure(shrinking)).toBe(false);
+    const generic = makeTask('T', { attempts: [v(1, 'BLOCKs remain after 2 cycles'), v(2, 'BLOCKs remain after 2 cycles')] });
+    expect(stuckOnIdenticalGateFailure(generic)).toBe(false);
+  });
+
+  it('tdd_red_expected: same files + same counts twice is stuck; different files written is not', () => {
+    const r = (pass: number, files: string[], passed: number) =>
+      withReason(pass, 'tdd_red_expected', 'red expected', { touched: files.map((path) => ({ path })), tdd: { phase: 'red', passed } });
+    expect(stuckOnIdenticalGateFailure(makeTask('T', { attempts: [r(1, ['test/a.test.ts'], 4), r(2, ['test/a.test.ts'], 4)] }))).toBe(true);
+    expect(stuckOnIdenticalGateFailure(makeTask('T', { attempts: [r(1, ['test/a.test.ts'], 4), r(2, ['test/a.test.ts', 'test/b.test.ts'], 4)] }))).toBe(false);
+  });
+
+  it('two timeouts in a row are stuck; two plain subagent crashes are not (may be transient)', () => {
+    const t = (pass: number) => withReason(pass, 'subagent_error', 'Subagent timed out after 3600s');
+    expect(stuckOnIdenticalGateFailure(makeTask('T', { attempts: [t(1), t(2)] }))).toBe(true);
+    const c = (pass: number) => withReason(pass, 'subagent_error', 'Subagent exited with code 1');
+    expect(stuckOnIdenticalGateFailure(makeTask('T', { attempts: [c(1), c(2)] }))).toBe(false);
+  });
+
+  it('a depends_on_unfinished_task placeholder between two identical failures does not hide the streak', () => {
+    const task = makeTask('T001', {
+      attempts: [
+        gateFailedAttempt(1, 'test', 1, 'same'),
+        withReason(1, 'depends_on_unfinished_task', 'Pass 1 ended with task still pending'),
+        gateFailedAttempt(2, 'test', 1, 'same'),
+      ],
+    });
+    expect(stuckOnIdenticalGateFailure(task)).toBe(true);
+  });
+});
+
+describe('synthetic task attempt caps', () => {
+  const done = new Date().toISOString();
+  const failedAttempt = (pass: number) => makeAttempt(pass, { finishedAt: done, deferReason: 'gate_failed', deferDetail: 'x' });
+
+  it('an ENHANCE task gets one real attempt, a VERIFY task two, a user task no cap', () => {
+    expect(syntheticAttemptsExhausted(makeTask('E', { kind: 'enhance', attempts: [] }))).toBe(false);
+    expect(syntheticAttemptsExhausted(makeTask('E', { kind: 'enhance', attempts: [failedAttempt(1)] }))).toBe(true);
+    expect(syntheticAttemptsExhausted(makeTask('V', { kind: 'verify', attempts: [failedAttempt(1)] }))).toBe(false);
+    expect(syntheticAttemptsExhausted(makeTask('V', { kind: 'verify', attempts: [failedAttempt(1), failedAttempt(2)] }))).toBe(true);
+    expect(syntheticAttemptsExhausted(makeTask('T', { attempts: [failedAttempt(1), failedAttempt(2), failedAttempt(3)] }))).toBe(false);
+  });
+
+  it('next() stops offering an exhausted enhance task but still serves other deferred tasks', () => {
+    const state = makeState(
+      [makeTask('E', { kind: 'enhance', status: 'deferred', attempts: [failedAttempt(1)] }), makeTask('T002', { status: 'deferred' })],
+      { currentPass: 2 }
+    );
+    expect(new TaskQueue(state).next()?.id).toBe('T002');
   });
 });
 

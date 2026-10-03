@@ -4,7 +4,7 @@
  * function over the task list so it is unit-testable and re-runnable on
  * resume without touching disk.
  *
- * Why this exists: /verify-loop on every task (3 cycles x 4 reviewers) was
+ * Why this exists: /verify-loop on every task (3 cycles x 4 reviewers, the original design) was
  * the single biggest cost in a run, and most of that spend went to tasks
  * where LLM review adds no signal (config, docs, a test-only task whose
  * "review" is the test itself). The classification lets `depthFor` route
@@ -17,7 +17,7 @@
  * reading the report can see why a task got `full` review (or didn't).
  */
 
-import type { RunConfig, Task, VerifyMode } from './types.js';
+import type { DeferReason, RunConfig, Task, TaskAttempt, VerifyMode } from './types.js';
 import type {
   TaskClassification,
   TaskKindClass,
@@ -223,14 +223,27 @@ export function classifyKind(task: Task): KindDecision {
 
 // ---------- risk heuristics ----------
 
-const HIGH_RISK_RE =
-  /\b(?:auth|login|logout|password|token|session|oauth|jwt|payment|billing|stripe|checkout|webhook|migration|schema|permission|rbac|role|secret|crypto|encrypt|upload|middleware|security|admin|delete|destroy|public api|rate.?limit)\b/i;
+// `full` review (3 reviewers x up to `verifyMaxCycles`) is the most expensive
+// thing the orchestrator buys, so it is reserved for tasks whose blast radius
+// is real. Two tiers keep ordinary CRUD from tripping it:
+//   - STRONG words are security / money / data-shape primitives: they mean
+//     the same thing wherever they appear, so title AND body count.
+//   - WEAK words are common nouns in plain feature work ("a design token",
+//     "delete returns 204", "role badge", "validate the schema", "session
+//     list"): only the TITLE counts — a bullet in the body mentioning one is
+//     acceptance detail, not the task's subject. A bland title over a risky
+//     body is what the explicit `- risk: high` marker is for (the planner is
+//     told to emit it).
+const HIGH_RISK_STRONG_RE =
+  /\b(?:auth|login|password|oauth|jwt|payment|billing|stripe|checkout|webhook|migration|permission|rbac|secret|crypto|encrypt|security|public api)\b/i;
+const HIGH_RISK_WEAK_RE =
+  /\b(?:logout|token|session|schema|role|upload|middleware|admin|delete|destroy|rate.?limit)\b/i;
 const LOW_RISK_TITLE_RE = /\b(?:rename|typo|comment|style|css|theme|format|lint fix)\b/i;
 
 function classifyRisk(task: Task, kind: TaskKindClass, markers: TaskMarkers): { risk: TaskRisk; rationale: string } {
   if (markers.risk) return { risk: markers.risk, rationale: `risk=${markers.risk} (marker)` };
   const { title, body } = heuristicText(task);
-  const highHit = firstMatch(HIGH_RISK_RE, `${title}\n${body}`);
+  const highHit = firstMatch(HIGH_RISK_STRONG_RE, `${title}\n${body}`) ?? firstMatch(HIGH_RISK_WEAK_RE, title);
   if (highHit) return { risk: 'high', rationale: `risk=high (heuristic: matched "${highHit}")` };
   if (kind === 'config' || kind === 'docs') {
     return { risk: 'low', rationale: `risk=low (heuristic: kind=${kind})` };
@@ -438,13 +451,66 @@ export function effectiveVerifyMode(
   return config.verifyMode ?? 'adaptive';
 }
 
+const DEPTH_RANK: Record<VerifyDepth, number> = { gates: 0, light: 1, full: 2 };
+
+/**
+ * Defers a re-review cannot help with: the failure was found by a machine
+ * (gate / audit / red-test expectation), the retry is told exactly what
+ * failed, and the orchestrator re-checks the fix the same way.
+ */
+const DETERMINISTIC_DEFERS: ReadonlySet<DeferReason> = new Set<DeferReason>([
+  'gate_failed',
+  'audit_failed',
+  'tdd_red_expected',
+]);
+
+/**
+ * The earlier attempt whose reviewers already ran CLEAN at `required` depth,
+ * when this retry only has to repair a deterministic failure — else
+ * undefined. The in-flight attempt (no `finishedAt`), synthetic
+ * `depends_on_unfinished_task` placeholders and attempts before a
+ * `fullauto retry` (`baselineResetAtAttempt`: a human intervened) are not
+ * consulted.
+ *
+ * Why: a task deferred on a gate / audit failure used to re-run the full
+ * reviewer set on the retry — N more spawns to re-check code the reviewers
+ * had already passed, when the fix is a failing assertion or an unwired
+ * import that the next gate run proves or disproves for free. A missing
+ * receipt (`verify-evidence` BLOCK, crash before the loop) is NOT a clean
+ * review, so those retries keep their depth. Deferrals that came FROM the
+ * reviewers (`verify_loop_blocks_remaining`) keep it too.
+ */
+export function priorCleanReview(
+  task: Pick<Task, 'attempts' | 'baselineResetAtAttempt'>,
+  required: VerifyDepth
+): TaskAttempt | undefined {
+  if (required === 'gates') return undefined;
+  const floor = task.baselineResetAtAttempt ?? 0;
+  const done = task.attempts.filter(
+    (a, i) => i >= floor && a.finishedAt !== undefined && a.deferReason !== 'depends_on_unfinished_task'
+  );
+  const last = done[done.length - 1];
+  if (!last?.deferReason || !DETERMINISTIC_DEFERS.has(last.deferReason)) return undefined;
+  return done.find(
+    (a) => a.verifyLoop !== undefined && (a.verifyLoop.block ?? 0) === 0 && DEPTH_RANK[a.verifyLoop.depth] >= DEPTH_RANK[required]
+  );
+}
+
 export function depthFor(
   cls: TaskClassification,
-  config: Pick<RunConfig, 'verifyMode' | 'useVerifyLoop'>
+  config: Pick<RunConfig, 'verifyMode' | 'useVerifyLoop'>,
+  task?: Pick<Task, 'attempts' | 'baselineResetAtAttempt'>
 ): VerifyDepth {
   const mode = effectiveVerifyMode(config);
   if (mode === 'gates-only') return 'gates';
+  // `full` is the user's explicit "review everything, every time" — a retry
+  // does not argue with it.
   if (mode === 'full') return 'full';
+  const base = adaptiveDepth(cls, mode);
+  return task && priorCleanReview(task, base) ? 'gates' : base;
+}
+
+function adaptiveDepth(cls: TaskClassification, mode: VerifyMode): VerifyDepth {
   // `feature`: per-task depth is gates; the synthetic VERIFY-<feature> task
   // injected at group end carries the full review (see orchestrator).
   if (mode === 'feature') return 'gates';
